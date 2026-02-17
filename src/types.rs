@@ -1,6 +1,17 @@
 #[derive(Debug, Clone, Copy)]
 pub enum ArithmeticTarget {
-    A, B, C, D, E, H, L,
+    A,
+    B,
+    C,
+    D,
+    E,
+    H,
+    L,
+}
+
+pub enum StackTarget {
+    BC,
+    DE,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10,6 +21,40 @@ pub enum JumpTest {
     NotCarry,
     Carry,
     Always,
+}
+
+pub enum IncDecTarget {
+    BC,
+}
+pub enum PrefixTarget {
+    B,
+}
+
+pub enum LoadByteTarget {
+    A,
+    B,
+    C,
+    D,
+    E,
+    H,
+    L,
+    HLI,
+}
+
+pub enum LoadByteSource {
+    A,
+    B,
+    C,
+    D,
+    E,
+    H,
+    L,
+    D8,
+    HLI,
+}
+
+pub enum LoadType {
+    Byte(LoadByteTarget, LoadByteSource),
 }
 
 // Flag bit positions (high nibble of F)

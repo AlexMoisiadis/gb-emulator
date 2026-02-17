@@ -18,7 +18,12 @@ impl MemoryBus {
     }
 
     #[inline]
-    pub fn write_byte(&mut self, address: u16, value: u8) {
-        self.memory[address as usize] = value;
+    pub fn read_next_byte(&self) -> u8 {
+        0
+    }
+
+    #[inline]
+    pub fn write_byte(&mut self, address: u16, byte: u8) {
+        self.memory[address as usize] = byte;
     }
 }
