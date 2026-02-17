@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "gb-emulator"
+name = "gb_emulator"
 version = "0.1.0"
