@@ -1,3 +1,4 @@
+// src/types.rs
 #[derive(Debug, Clone, Copy)]
 pub enum ArithmeticTarget {
     A,
@@ -9,6 +10,7 @@ pub enum ArithmeticTarget {
     L,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum StackTarget {
     BC,
     DE,
@@ -23,13 +25,29 @@ pub enum JumpTest {
     Always,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum IncDecTarget {
     BC,
 }
+
+#[derive(Debug, Clone, Copy)]
 pub enum PrefixTarget {
     B,
 }
 
+// New: 16-bit register names for addressing/data ops
+#[derive(Debug, Clone, Copy)]
+pub enum Reg16 {
+    AF,
+    BC,
+    DE,
+    HL,
+    SP,
+    PC,
+}
+
+// 8-bit load targets/sources
+#[derive(Debug, Clone, Copy)]
 pub enum LoadByteTarget {
     A,
     B,
@@ -38,9 +56,13 @@ pub enum LoadByteTarget {
     E,
     H,
     L,
-    HLI,
+    HLI, // legacy placeholder for (HL) if you need it
+    MemReg16(Reg16), // (BC), (DE), (HL)
+    MemImm8, // (a8)
+    MemImm16, // (a16)
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum LoadByteSource {
     A,
     B,
@@ -50,9 +72,13 @@ pub enum LoadByteSource {
     H,
     L,
     D8,
-    HLI,
+    HLI, // legacy placeholder for (HL)
+    MemReg16(Reg16), // (BC), (DE), (HL)
+    MemImm8, // (a8)
+    MemImm16, // (a16)
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum LoadType {
     Byte(LoadByteTarget, LoadByteSource),
 }

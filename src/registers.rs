@@ -1,3 +1,4 @@
+// src/registers.rs
 use crate::types::{
     CARRY_FLAG_BYTE_POSITION,
     HALF_CARRY_FLAG_BYTE_POSITION,
@@ -28,17 +29,11 @@ impl From<u8> for FlagsRegister {
         let subtract = ((byte >> SUBTRACT_FLAG_BYTE_POSITION) & 0b1) != 0;
         let half_carry = ((byte >> HALF_CARRY_FLAG_BYTE_POSITION) & 0b1) != 0;
         let carry = ((byte >> CARRY_FLAG_BYTE_POSITION) & 0b1) != 0;
-
-        FlagsRegister {
-            zero,
-            subtract,
-            half_carry,
-            carry,
-        }
+        FlagsRegister { zero, subtract, half_carry, carry }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Registers {
     pub a: u8,
     pub b: u8,
@@ -50,38 +45,34 @@ pub struct Registers {
     pub l: u8,
 }
 
-impl Default for Registers {
-    fn default() -> Self {
-        Self {
-            a: 0,
-            b: 0,
-            c: 0,
-            d: 0,
-            e: 0,
-            f: FlagsRegister::default(),
-            h: 0,
-            l: 0,
-        }
-    }
-}
-
 impl Registers {
+    #[inline]
     pub fn get_bc(&self) -> u16 {
         ((self.b as u16) << 8) | (self.c as u16)
     }
-
+    #[inline]
     pub fn set_bc(&mut self, value: u16) {
-        self.b = ((value & 0xff00) >> 8) as u8;
-        self.c = (value & 0x00ff) as u8;
+        self.b = (value >> 8) as u8;
+        self.c = value as u8;
     }
 
-    pub fn get_hl(&self) -> u16 {
-        0
-    }
-
+    #[inline]
     pub fn get_de(&self) -> u16 {
-        0
+        ((self.d as u16) << 8) | (self.e as u16)
+    }
+    #[inline]
+    pub fn set_de(&mut self, value: u16) {
+        self.d = (value >> 8) as u8;
+        self.e = value as u8;
     }
 
-    // Add more pairs (DE/HL) as needed
+    #[inline]
+    pub fn get_hl(&self) -> u16 {
+        ((self.h as u16) << 8) | (self.l as u16)
+    }
+    #[inline]
+    pub fn set_hl(&mut self, value: u16) {
+        self.h = (value >> 8) as u8;
+        self.l = value as u8;
+    }
 }
