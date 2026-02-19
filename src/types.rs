@@ -30,13 +30,22 @@ pub enum JumpTest {
 #[derive(Debug, Clone, Copy)]
 pub enum IncDecTarget {
     BC,
+    DE,
+    HL,
+    SP,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum PrefixTarget {
     B,
+    C,
+    D,
+    E,
+    H,
+    L,
+    HL,
+    A,
 }
-
 // New: 16-bit register names for addressing/data ops
 #[derive(Debug, Clone, Copy)]
 pub enum Reg16 {

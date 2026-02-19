@@ -30,6 +30,7 @@ pub enum Instruction {
     // 8-bit INC/DEC targets (registers and (HL))
     INC8(LoadByteTarget),
     DEC8(LoadByteTarget),
+    DEC(IncDecTarget),
 
     // 16-bit inc/dec (you currently use BC here)
     INC(IncDecTarget),
@@ -73,6 +74,16 @@ pub enum Instruction {
     // Stack
     PUSH(StackTarget),
     POP(StackTarget),
+    RRC(PrefixTarget),
+    RL(PrefixTarget),
+    RR(PrefixTarget),
+    SLA(PrefixTarget),
+    SRA(PrefixTarget),
+    SWAP(PrefixTarget),
+    SRL(PrefixTarget),
+    BIT(u8, PrefixTarget),
+    RES(u8, PrefixTarget),
+    SET(u8, PrefixTarget),
 
     // Misc
     NOP, // 0x00
@@ -88,11 +99,339 @@ impl Instruction {
     pub fn from_byte(byte: u8, prefixed: bool) -> Result<Instruction, DecodeError> {
         if prefixed { Self::from_byte_prefixed(byte) } else { Self::from_byte_not_prefixed(byte) }
     }
-
     fn from_byte_prefixed(byte: u8) -> Result<Instruction, DecodeError> {
+        // CB instructions have this pattern: [operation][bit/register]
+        // high 3 bits: operation group (RLC/RRC/RL/RR/SLA/SRA/SWAP/SRL)
+        // mid 3 bits: bit index for BIT/RES/SET
+        // low 3 bits: target register
+        let op_group = byte >> 6;
+        let sub_op = (byte >> 3) & 0b111;
+        let reg_code = byte & 0b111;
+
+        let target = Self::decode_prefix_target(reg_code);
+
+        match op_group {
+            0b00 =>
+                match sub_op {
+                    0b000 => Ok(Instruction::RLC(target)),
+                    0b001 => Ok(Instruction::RRC(target)),
+                    0b010 => Ok(Instruction::RL(target)),
+                    0b011 => Ok(Instruction::RR(target)),
+                    0b100 => Ok(Instruction::SLA(target)),
+                    0b101 => Ok(Instruction::SRA(target)),
+                    0b110 => Ok(Instruction::SWAP(target)),
+                    0b111 => Ok(Instruction::SRL(target)),
+                    _ => unreachable!(),
+                }
+            0b01 => Ok(Instruction::BIT(sub_op, target)),
+            0b10 => Ok(Instruction::RES(sub_op, target)),
+            0b11 => Ok(Instruction::SET(sub_op, target)),
+            _ => unreachable!(),
+        }
+    }
+
+    fn from_byte_not_prefixed(byte: u8) -> Result<Instruction, DecodeError> {
+        // --- Single-byte explicit instructions ---
         match byte {
-            0x00 => Ok(Instruction::RLC(PrefixTarget::B)), // CB 00: RLC B
-            _ => Err(DecodeError::UnknownOpcode(byte, true)),
+            0x00 => {
+                return Ok(Instruction::NOP);
+            }
+            0x76 => {
+                return Ok(Instruction::HALT);
+            }
+            0xfb => {
+                return Ok(Instruction::EI);
+            }
+            0xf3 => {
+                return Ok(Instruction::DI);
+            }
+            0xd9 => {
+                return Ok(Instruction::RETI);
+            }
+            0x08 => {
+                return Ok(Instruction::LdA16Sp);
+            }
+            0xf9 => {
+                return Ok(Instruction::LdSpHl);
+            }
+            // Unconditional control flow (missing previously)
+            0xc3 => {
+                return Ok(Instruction::JP(JumpTest::Always));
+            }
+            0xcd => {
+                return Ok(Instruction::CALL(JumpTest::Always));
+            }
+            0xc9 => {
+                return Ok(Instruction::RET(JumpTest::Always));
+            }
+
+            // RST vectors
+            0xc7 | 0xcf | 0xd7 | 0xdf | 0xe7 | 0xef | 0xf7 | 0xff => {
+                return Ok(Instruction::Rst((byte & 0b0011_1000) as u16));
+            }
+            _ => {}
+        }
+
+        // --- 8-bit INC/DEC (explicitly enumerate the well-formed pattern) ---
+        // INC r:  0x04,0x0C,0x14,0x1C,0x24,0x2C,0x34,0x3C
+        // DEC r:  0x05,0x0D,0x15,0x1D,0x25,0x2D,0x35,0x3D
+        // Pattern: INC => (byte & 0b11_000_111) == 0b00_000_100
+        //          DEC => (byte & 0b11_000_111) == 0b00_000_101
+        let low3 = byte & 0b111;
+        let hi2 = (byte >> 6) & 0b11;
+        if hi2 == 0 && low3 == 0b100 {
+            let dst = Self::reg_code_to_target((byte >> 3) & 0b111);
+            return Ok(Instruction::INC8(dst));
+        }
+        if hi2 == 0 && low3 == 0b101 {
+            let dst = Self::reg_code_to_target((byte >> 3) & 0b111);
+            return Ok(Instruction::DEC8(dst));
+        }
+
+        // --- LD r,r' (and HALT handled earlier) ---
+        if (0x40..=0x7f).contains(&byte) {
+            let dst = Self::reg_code_to_target((byte >> 3) & 0b111);
+            let src = Self::reg_code_to_source(byte & 0b111);
+            return Ok(Instruction::LD(LoadType::Byte(dst, src)));
+        }
+
+        // --- LD r,d8 (immediate 8-bit) ---
+        // Valid when low 3 bits == 110, covering 0x06,0x0E,0x16,0x1E,0x26,0x2E,0x36,0x3E
+        if (0x06..=0x3e).contains(&byte) && (byte & 0b111) == 0b110 {
+            let dst = Self::reg_code_to_target((byte >> 3) & 0b111);
+            return Ok(Instruction::LD(LoadType::Byte(dst, LoadByteSource::D8)));
+        }
+
+        // --- 16-bit INC/DEC ---
+        match byte {
+            0x03 => {
+                return Ok(Instruction::INC(IncDecTarget::BC));
+            }
+            0x13 => {
+                return Ok(Instruction::INC(IncDecTarget::DE));
+            }
+            0x23 => {
+                return Ok(Instruction::INC(IncDecTarget::HL));
+            }
+            0x33 => {
+                return Ok(Instruction::INC(IncDecTarget::SP));
+            }
+            0x0b => {
+                return Ok(Instruction::DEC(IncDecTarget::BC));
+            }
+            0x1b => {
+                return Ok(Instruction::DEC(IncDecTarget::DE));
+            }
+            0x2b => {
+                return Ok(Instruction::DEC(IncDecTarget::HL));
+            }
+            0x3b => {
+                return Ok(Instruction::DEC(IncDecTarget::SP));
+            }
+            _ => {}
+        }
+
+        // --- ALU ops: A, r|(HL) ---
+        let alu_ops = [
+            (0x80, Instruction::AddA as fn(LoadByteSource) -> Instruction),
+            (0x88, Instruction::AdcA as fn(LoadByteSource) -> Instruction),
+            (0x90, Instruction::SubA as fn(LoadByteSource) -> Instruction),
+            (0x98, Instruction::SbcA as fn(LoadByteSource) -> Instruction),
+            (0xa0, Instruction::AndA as fn(LoadByteSource) -> Instruction),
+            (0xa8, Instruction::XorA as fn(LoadByteSource) -> Instruction),
+            (0xb0, Instruction::OrA as fn(LoadByteSource) -> Instruction),
+            (0xb8, Instruction::CpA as fn(LoadByteSource) -> Instruction),
+        ];
+        for &(base, ctor) in &alu_ops {
+            if (byte & 0xf8) == base {
+                let src = Self::reg_code_to_source(byte & 0b111);
+                return Ok(ctor(src));
+            }
+        }
+
+        // --- ALU immediate (A,d8) ---
+        let alu_imm = [
+            (0xc6, Instruction::AddA as fn(LoadByteSource) -> Instruction),
+            (0xce, Instruction::AdcA),
+            (0xd6, Instruction::SubA),
+            (0xde, Instruction::SbcA),
+            (0xe6, Instruction::AndA),
+            (0xee, Instruction::XorA),
+            (0xf6, Instruction::OrA),
+            (0xfe, Instruction::CpA),
+        ];
+        for &(op, ctor) in &alu_imm {
+            if byte == op {
+                return Ok(ctor(LoadByteSource::D8));
+            }
+        }
+
+        // --- Relative jumps JR (explicit 5 opcodes) ---
+        match byte {
+            0x18 => {
+                return Ok(Instruction::JR(JumpTest::Always));
+            }
+            0x20 => {
+                return Ok(Instruction::JR(JumpTest::NotZero));
+            }
+            0x28 => {
+                return Ok(Instruction::JR(JumpTest::Zero));
+            }
+            0x30 => {
+                return Ok(Instruction::JR(JumpTest::NotCarry));
+            }
+            0x38 => {
+                return Ok(Instruction::JR(JumpTest::Carry));
+            }
+            _ => {}
+        }
+
+        // --- JP, CALL, RET (conditional opcodes) ---
+        match byte {
+            // JP cc, a16
+            0xc2 => {
+                return Ok(Instruction::JP(JumpTest::NotZero));
+            }
+            0xca => {
+                return Ok(Instruction::JP(JumpTest::Zero));
+            }
+            0xd2 => {
+                return Ok(Instruction::JP(JumpTest::NotCarry));
+            }
+            0xda => {
+                return Ok(Instruction::JP(JumpTest::Carry));
+            }
+            // CALL cc, a16
+            0xc4 => {
+                return Ok(Instruction::CALL(JumpTest::NotZero));
+            }
+            0xcc => {
+                return Ok(Instruction::CALL(JumpTest::Zero));
+            }
+            0xd4 => {
+                return Ok(Instruction::CALL(JumpTest::NotCarry));
+            }
+            0xdc => {
+                return Ok(Instruction::CALL(JumpTest::Carry));
+            }
+            // RET cc
+            0xc0 => {
+                return Ok(Instruction::RET(JumpTest::NotZero));
+            }
+            0xc8 => {
+                return Ok(Instruction::RET(JumpTest::Zero));
+            }
+            0xd0 => {
+                return Ok(Instruction::RET(JumpTest::NotCarry));
+            }
+            0xd8 => {
+                return Ok(Instruction::RET(JumpTest::Carry));
+            }
+            _ => {}
+        }
+
+        // --- Addressed loads & pointers ---
+        match byte {
+            0x02 => {
+                return Ok(
+                    Instruction::LD(
+                        LoadType::Byte(LoadByteTarget::MemReg16(Reg16::BC), LoadByteSource::A)
+                    )
+                );
+            }
+            0x0a => {
+                return Ok(
+                    Instruction::LD(
+                        LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemReg16(Reg16::BC))
+                    )
+                );
+            }
+            0x12 => {
+                return Ok(
+                    Instruction::LD(
+                        LoadType::Byte(LoadByteTarget::MemReg16(Reg16::DE), LoadByteSource::A)
+                    )
+                );
+            }
+            0x1a => {
+                return Ok(
+                    Instruction::LD(
+                        LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemReg16(Reg16::DE))
+                    )
+                );
+            }
+            0x22 => {
+                return Ok(Instruction::LdHliA);
+            }
+            0x2a => {
+                return Ok(Instruction::LdAHli);
+            }
+            0x32 => {
+                return Ok(Instruction::LdHldA);
+            }
+            0x3a => {
+                return Ok(Instruction::LdAHld);
+            }
+            0xea => {
+                return Ok(
+                    Instruction::LD(LoadType::Byte(LoadByteTarget::MemImm16, LoadByteSource::A))
+                );
+            }
+            0xfa => {
+                return Ok(
+                    Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemImm16))
+                );
+            }
+            0xe0 => {
+                return Ok(
+                    Instruction::LD(LoadType::Byte(LoadByteTarget::MemImm8, LoadByteSource::A))
+                );
+            }
+            0xf0 => {
+                return Ok(
+                    Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemImm8))
+                );
+            }
+            0xe2 => {
+                return Ok(
+                    Instruction::LD(LoadType::Byte(LoadByteTarget::MemHighC, LoadByteSource::A))
+                );
+            }
+            0xf2 => {
+                return Ok(
+                    Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemHighC))
+                );
+            }
+            0x01 => {
+                return Ok(Instruction::LD16Imm(Reg16::BC));
+            }
+            0x11 => {
+                return Ok(Instruction::LD16Imm(Reg16::DE));
+            }
+            0x21 => {
+                return Ok(Instruction::LD16Imm(Reg16::HL));
+            }
+            0x31 => {
+                return Ok(Instruction::LD16Imm(Reg16::SP));
+            }
+            _ => {}
+        }
+
+        Err(DecodeError::UnknownOpcode(byte, false))
+    }
+
+    #[inline]
+    fn decode_prefix_target(code: u8) -> PrefixTarget {
+        match code & 0b111 {
+            0b000 => PrefixTarget::B,
+            0b001 => PrefixTarget::C,
+            0b010 => PrefixTarget::D,
+            0b011 => PrefixTarget::E,
+            0b100 => PrefixTarget::H,
+            0b101 => PrefixTarget::L,
+            0b110 => PrefixTarget::HL,
+            0b111 => PrefixTarget::A,
+            _ => unreachable!(),
         }
     }
 
@@ -124,447 +463,5 @@ impl Instruction {
             0b111 => LoadByteSource::A,
             _ => unreachable!(),
         }
-    }
-
-    fn from_byte_not_prefixed(byte: u8) -> Result<Instruction, DecodeError> {
-        // --- Special: NOP ---
-        if byte == 0x00 {
-            return Ok(Instruction::NOP);
-        }
-
-        // --- LD r,r' block (0x40..=0x7F), except 0x76=HALT ---
-        if (0x40..=0x7f).contains(&byte) {
-            if byte == 0x76 {
-                return Ok(Instruction::HALT);
-            }
-            let dst_code = (byte >> 3) & 0b111;
-            let src_code = byte & 0b111;
-            let dst = Self::reg_code_to_target(dst_code);
-            let src = Self::reg_code_to_source(src_code);
-            return Ok(Instruction::LD(LoadType::Byte(dst, src)));
-        }
-
-        match byte {
-            // -------- Addressed loads & pointer helpers --------
-            0x02 =>
-                Ok(
-                    Instruction::LD(
-                        LoadType::Byte(LoadByteTarget::MemReg16(Reg16::BC), LoadByteSource::A)
-                    )
-                ), // LD (BC),A
-            0x0a =>
-                Ok(
-                    Instruction::LD(
-                        LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemReg16(Reg16::BC))
-                    )
-                ), // LD A,(BC)
-            0x12 =>
-                Ok(
-                    Instruction::LD(
-                        LoadType::Byte(LoadByteTarget::MemReg16(Reg16::DE), LoadByteSource::A)
-                    )
-                ), // LD (DE),A
-            0x1a =>
-                Ok(
-                    Instruction::LD(
-                        LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemReg16(Reg16::DE))
-                    )
-                ), // LD A,(DE)
-
-            // HL+ / HL-
-            0x22 => Ok(Instruction::LdHliA), // LD (HL+),A
-            0x2a => Ok(Instruction::LdAHli), // LD A,(HL+)
-            0x32 => Ok(Instruction::LdHldA), // LD (HL-),A
-            0x3a => Ok(Instruction::LdAHld), // LD A,(HL-)
-
-            // Absolute addressing (a16)
-            0xea =>
-                Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::MemImm16, LoadByteSource::A))), // LD (a16),A
-            0xfa =>
-                Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemImm16))), // LD A,(a16)
-
-            // High-RAM I/O (FF00 + a8) and (FF00 + C)
-            0xe0 => Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::MemImm8, LoadByteSource::A))), // LDH (a8),A
-            0xf0 => Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemImm8))), // LDH A,(a8)
-            0xe2 =>
-                Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::MemHighC, LoadByteSource::A))), // LD (C),A
-            0xf2 =>
-                Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemHighC))), // LD A,(C)
-
-            // LD (a16),SP and LD SP,HL
-            0x08 => Ok(Instruction::LdA16Sp), // LD (a16),SP
-            0xf9 => Ok(Instruction::LdSpHl), // LD SP,HL
-
-            // -------- Immediate loads (LD r,d8) --------
-            0x06 => Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::B, LoadByteSource::D8))),
-            0x0e => Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::C, LoadByteSource::D8))),
-            0x16 => Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::D, LoadByteSource::D8))),
-            0x1e => Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::E, LoadByteSource::D8))),
-            0x26 => Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::H, LoadByteSource::D8))),
-            0x2e => Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::L, LoadByteSource::D8))),
-            0x3e => Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::D8))),
-
-            // -------- 16-bit immediate loads (LD rr,d16) --------
-            0x01 => Ok(Instruction::LD16Imm(Reg16::BC)),
-            0x11 => Ok(Instruction::LD16Imm(Reg16::DE)),
-            0x21 => Ok(Instruction::LD16Imm(Reg16::HL)),
-            0x31 => Ok(Instruction::LD16Imm(Reg16::SP)),
-
-            // -------- 8-bit INC/DEC (registers and (HL)) --------
-            0x04 => Ok(Instruction::INC8(LoadByteTarget::B)),
-            0x0c => Ok(Instruction::INC8(LoadByteTarget::C)),
-            0x14 => Ok(Instruction::INC8(LoadByteTarget::D)),
-            0x1c => Ok(Instruction::INC8(LoadByteTarget::E)),
-            0x24 => Ok(Instruction::INC8(LoadByteTarget::H)),
-            0x2c => Ok(Instruction::INC8(LoadByteTarget::L)),
-            0x34 => Ok(Instruction::INC8(LoadByteTarget::MemReg16(Reg16::HL))),
-            0x3c => Ok(Instruction::INC8(LoadByteTarget::A)),
-
-            0x05 => Ok(Instruction::DEC8(LoadByteTarget::B)),
-            0x0d => Ok(Instruction::DEC8(LoadByteTarget::C)),
-            0x15 => Ok(Instruction::DEC8(LoadByteTarget::D)),
-            0x1d => Ok(Instruction::DEC8(LoadByteTarget::E)),
-            0x25 => Ok(Instruction::DEC8(LoadByteTarget::H)),
-            0x2d => Ok(Instruction::DEC8(LoadByteTarget::L)),
-            0x35 => Ok(Instruction::DEC8(LoadByteTarget::MemReg16(Reg16::HL))),
-            0x3d => Ok(Instruction::DEC8(LoadByteTarget::A)),
-
-            // 16-bit INC (you currently use BC here)
-            0x03 => Ok(Instruction::INC(IncDecTarget::BC)),
-
-            // -------- ALU group (register/(HL) tables) --------
-            // 0x80..=0x87: ADD A,r
-            0x80..=0x87 => {
-                let s = Self::reg_code_to_source(byte & 0b111);
-                Ok(Instruction::AddA(s))
-            }
-            // 0x88..=0x8F: ADC A,r
-            0x88..=0x8f => {
-                let s = Self::reg_code_to_source(byte & 0b111);
-                Ok(Instruction::AdcA(s))
-            }
-            // 0x90..=0x97: SUB A,r
-            0x90..=0x97 => {
-                let s = Self::reg_code_to_source(byte & 0b111);
-                Ok(Instruction::SubA(s))
-            }
-            // 0x98..=0x9F: SBC A,r
-            0x98..=0x9f => {
-                let s = Self::reg_code_to_source(byte & 0b111);
-                Ok(Instruction::SbcA(s))
-            }
-            // 0xA0..=0xA7: AND A,r
-            0xa0..=0xa7 => {
-                let s = Self::reg_code_to_source(byte & 0b111);
-                Ok(Instruction::AndA(s))
-            }
-            // 0xA8..=0xAF: XOR A,r
-            0xa8..=0xaf => {
-                let s = Self::reg_code_to_source(byte & 0b111);
-                Ok(Instruction::XorA(s))
-            }
-            // 0xB0..=0xB7: OR A,r
-            0xb0..=0xb7 => {
-                let s = Self::reg_code_to_source(byte & 0b111);
-                Ok(Instruction::OrA(s))
-            }
-            // 0xB8..=0xBF: CP A,r
-            0xb8..=0xbf => {
-                let s = Self::reg_code_to_source(byte & 0b111);
-                Ok(Instruction::CpA(s))
-            }
-
-            // ----- RST vectors -----
-            0xc7 => Ok(Instruction::Rst(0x00)), // RST 00h
-            0xcf => Ok(Instruction::Rst(0x08)), // RST 08h
-            0xd7 => Ok(Instruction::Rst(0x10)), // RST 10h
-            0xdf => Ok(Instruction::Rst(0x18)), // RST 18h
-            0xe7 => Ok(Instruction::Rst(0x20)), // RST 20h
-            0xef => Ok(Instruction::Rst(0x28)), // RST 28h
-            0xf7 => Ok(Instruction::Rst(0x30)), // RST 30h
-            0xff => Ok(Instruction::Rst(0x38)), // RST 38h
-
-            // ALU immediates (A, d8)
-            0xc6 => Ok(Instruction::AddA(LoadByteSource::D8)),
-            0xce => Ok(Instruction::AdcA(LoadByteSource::D8)),
-            0xd6 => Ok(Instruction::SubA(LoadByteSource::D8)),
-            0xde => Ok(Instruction::SbcA(LoadByteSource::D8)),
-            0xe6 => Ok(Instruction::AndA(LoadByteSource::D8)),
-            0xee => Ok(Instruction::XorA(LoadByteSource::D8)),
-            0xf6 => Ok(Instruction::OrA(LoadByteSource::D8)),
-            0xfe => Ok(Instruction::CpA(LoadByteSource::D8)),
-
-            // EI / DI / RETI
-            0xfb => Ok(Instruction::EI),
-            0xf3 => Ok(Instruction::DI),
-            0xd9 => Ok(Instruction::RETI),
-
-            // -------- Relative jumps --------
-            0x18 => Ok(Instruction::JR(JumpTest::Always)), // JR +e8
-            0x20 => Ok(Instruction::JR(JumpTest::NotZero)), // JR NZ,+e8
-            0x28 => Ok(Instruction::JR(JumpTest::Zero)), // JR Z,+e8
-            0x30 => Ok(Instruction::JR(JumpTest::NotCarry)), // JR NC,+e8
-            0x38 => Ok(Instruction::JR(JumpTest::Carry)), // JR C,+e8
-
-            // -------- Jumps: unconditional + conditional --------
-            0xc3 => Ok(Instruction::JP(JumpTest::Always)), // JP a16
-            0xc2 => Ok(Instruction::JP(JumpTest::NotZero)), // JP NZ,a16
-            0xca => Ok(Instruction::JP(JumpTest::Zero)), // JP Z,a16
-            0xd2 => Ok(Instruction::JP(JumpTest::NotCarry)), // JP NC,a16
-            0xda => Ok(Instruction::JP(JumpTest::Carry)), // JP C,a16
-
-            // -------- CALL: unconditional + conditional --------
-            0xcd => Ok(Instruction::CALL(JumpTest::Always)), // CALL a16
-            0xc4 => Ok(Instruction::CALL(JumpTest::NotZero)), // CALL NZ,a16
-            0xcc => Ok(Instruction::CALL(JumpTest::Zero)), // CALL Z,a16
-            0xd4 => Ok(Instruction::CALL(JumpTest::NotCarry)), // CALL NC,a16
-            0xdc => Ok(Instruction::CALL(JumpTest::Carry)), // CALL C,a16
-
-            // -------- RET: unconditional + conditional --------
-            0xc9 => Ok(Instruction::RET(JumpTest::Always)), // RET
-            0xc0 => Ok(Instruction::RET(JumpTest::NotZero)), // RET NZ
-            0xc8 => Ok(Instruction::RET(JumpTest::Zero)), // RET Z
-            0xd0 => Ok(Instruction::RET(JumpTest::NotCarry)), // RET NC
-            0xd8 => Ok(Instruction::RET(JumpTest::Carry)), // RET C
-
-            // -------- Stack: POP/PUSH --------
-            0xc1 => Ok(Instruction::POP(StackTarget::BC)),
-            0xd1 => Ok(Instruction::POP(StackTarget::DE)),
-            0xe1 => Ok(Instruction::POP(StackTarget::HL)),
-            0xf1 => Ok(Instruction::POP(StackTarget::AF)),
-
-            0xc5 => Ok(Instruction::PUSH(StackTarget::BC)),
-            0xd5 => Ok(Instruction::PUSH(StackTarget::DE)),
-            0xe5 => Ok(Instruction::PUSH(StackTarget::HL)),
-            0xf5 => Ok(Instruction::PUSH(StackTarget::AF)),
-
-            _ => Err(DecodeError::UnknownOpcode(byte, false)),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decodes_ld_rr_prime_basic() {
-        assert!(
-            matches!(
-                Instruction::from_byte(0x78, false),
-                Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::B)))
-            )
-        );
-        assert!(
-            matches!(
-                Instruction::from_byte(0x47, false),
-                Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::B, LoadByteSource::A)))
-            )
-        );
-        assert!(
-            matches!(
-                Instruction::from_byte(0x7e, false),
-                Ok(
-                    Instruction::LD(
-                        LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemReg16(Reg16::HL))
-                    )
-                )
-            )
-        );
-        assert!(
-            matches!(
-                Instruction::from_byte(0x70, false),
-                Ok(
-                    Instruction::LD(
-                        LoadType::Byte(LoadByteTarget::MemReg16(Reg16::HL), LoadByteSource::B)
-                    )
-                )
-            )
-        );
-        assert!(matches!(Instruction::from_byte(0x76, false), Ok(Instruction::HALT)));
-    }
-
-    #[test]
-    fn decodes_inc_dec_8bit_subset() {
-        assert!(
-            matches!(Instruction::from_byte(0x04, false), Ok(Instruction::INC8(LoadByteTarget::B)))
-        );
-        assert!(
-            matches!(
-                Instruction::from_byte(0x35, false),
-                Ok(Instruction::DEC8(LoadByteTarget::MemReg16(Reg16::HL)))
-            )
-        );
-        assert!(
-            matches!(Instruction::from_byte(0x3d, false), Ok(Instruction::DEC8(LoadByteTarget::A)))
-        );
-    }
-
-    #[test]
-    fn decodes_hl_plus_minus_variants() {
-        assert!(matches!(Instruction::from_byte(0x22, false), Ok(Instruction::LdHliA)));
-        assert!(matches!(Instruction::from_byte(0x2a, false), Ok(Instruction::LdAHli)));
-        assert!(matches!(Instruction::from_byte(0x32, false), Ok(Instruction::LdHldA)));
-        assert!(matches!(Instruction::from_byte(0x3a, false), Ok(Instruction::LdAHld)));
-    }
-
-    #[test]
-    fn decodes_ldh_and_c_indexed() {
-        assert!(
-            matches!(
-                Instruction::from_byte(0xe0, false),
-                Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::MemImm8, LoadByteSource::A)))
-            )
-        );
-        assert!(
-            matches!(
-                Instruction::from_byte(0xf0, false),
-                Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemImm8)))
-            )
-        );
-        assert!(
-            matches!(
-                Instruction::from_byte(0xe2, false),
-                Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::MemHighC, LoadByteSource::A)))
-            )
-        );
-        assert!(
-            matches!(
-                Instruction::from_byte(0xf2, false),
-                Ok(Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemHighC)))
-            )
-        );
-    }
-
-    #[test]
-    fn decodes_ld_rr_d16_and_sp_hl_a16_sp() {
-        assert!(matches!(Instruction::from_byte(0x01, false), Ok(Instruction::LD16Imm(Reg16::BC))));
-        assert!(matches!(Instruction::from_byte(0x11, false), Ok(Instruction::LD16Imm(Reg16::DE))));
-        assert!(matches!(Instruction::from_byte(0x21, false), Ok(Instruction::LD16Imm(Reg16::HL))));
-        assert!(matches!(Instruction::from_byte(0x31, false), Ok(Instruction::LD16Imm(Reg16::SP))));
-        assert!(matches!(Instruction::from_byte(0x08, false), Ok(Instruction::LdA16Sp)));
-        assert!(matches!(Instruction::from_byte(0xf9, false), Ok(Instruction::LdSpHl)));
-    }
-
-    #[test]
-    fn decodes_alu_tables_and_immediates() {
-        use LoadByteSource::*;
-        assert!(matches!(Instruction::from_byte(0x87, false), Ok(Instruction::AddA(A))));
-        assert!(
-            matches!(
-                Instruction::from_byte(0x86, false),
-                Ok(Instruction::AddA(LoadByteSource::MemReg16(Reg16::HL)))
-            )
-        );
-        assert!(matches!(Instruction::from_byte(0xce, false), Ok(Instruction::AdcA(D8))));
-        assert!(matches!(Instruction::from_byte(0xd6, false), Ok(Instruction::SubA(D8))));
-        assert!(matches!(Instruction::from_byte(0xe6, false), Ok(Instruction::AndA(D8))));
-        assert!(matches!(Instruction::from_byte(0xee, false), Ok(Instruction::XorA(D8))));
-        assert!(matches!(Instruction::from_byte(0xf6, false), Ok(Instruction::OrA(D8))));
-        assert!(matches!(Instruction::from_byte(0xfe, false), Ok(Instruction::CpA(D8))));
-    }
-
-    #[test]
-    fn decodes_jr_and_conditional_jumps_calls_rets() {
-        assert!(
-            matches!(Instruction::from_byte(0x18, false), Ok(Instruction::JR(JumpTest::Always)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0x20, false), Ok(Instruction::JR(JumpTest::NotZero)))
-        );
-        assert!(matches!(Instruction::from_byte(0x28, false), Ok(Instruction::JR(JumpTest::Zero))));
-        assert!(
-            matches!(Instruction::from_byte(0x30, false), Ok(Instruction::JR(JumpTest::NotCarry)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0x38, false), Ok(Instruction::JR(JumpTest::Carry)))
-        );
-
-        assert!(
-            matches!(Instruction::from_byte(0xc3, false), Ok(Instruction::JP(JumpTest::Always)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xc2, false), Ok(Instruction::JP(JumpTest::NotZero)))
-        );
-        assert!(matches!(Instruction::from_byte(0xca, false), Ok(Instruction::JP(JumpTest::Zero))));
-        assert!(
-            matches!(Instruction::from_byte(0xd2, false), Ok(Instruction::JP(JumpTest::NotCarry)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xda, false), Ok(Instruction::JP(JumpTest::Carry)))
-        );
-
-        assert!(
-            matches!(Instruction::from_byte(0xcd, false), Ok(Instruction::CALL(JumpTest::Always)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xc4, false), Ok(Instruction::CALL(JumpTest::NotZero)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xcc, false), Ok(Instruction::CALL(JumpTest::Zero)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xd4, false), Ok(Instruction::CALL(JumpTest::NotCarry)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xdc, false), Ok(Instruction::CALL(JumpTest::Carry)))
-        );
-
-        assert!(
-            matches!(Instruction::from_byte(0xc9, false), Ok(Instruction::RET(JumpTest::Always)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xc0, false), Ok(Instruction::RET(JumpTest::NotZero)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xc8, false), Ok(Instruction::RET(JumpTest::Zero)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xd0, false), Ok(Instruction::RET(JumpTest::NotCarry)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xd8, false), Ok(Instruction::RET(JumpTest::Carry)))
-        );
-    }
-
-    #[test]
-    fn decodes_push_pop_pairs() {
-        assert!(
-            matches!(Instruction::from_byte(0xc1, false), Ok(Instruction::POP(StackTarget::BC)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xd1, false), Ok(Instruction::POP(StackTarget::DE)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xe1, false), Ok(Instruction::POP(StackTarget::HL)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xf1, false), Ok(Instruction::POP(StackTarget::AF)))
-        );
-
-        assert!(
-            matches!(Instruction::from_byte(0xc5, false), Ok(Instruction::PUSH(StackTarget::BC)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xd5, false), Ok(Instruction::PUSH(StackTarget::DE)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xe5, false), Ok(Instruction::PUSH(StackTarget::HL)))
-        );
-        assert!(
-            matches!(Instruction::from_byte(0xf5, false), Ok(Instruction::PUSH(StackTarget::AF)))
-        );
-    }
-
-    #[test]
-    fn decodes_rst_vectors() {
-        assert!(matches!(Instruction::from_byte(0xc7, false), Ok(Instruction::Rst(0x0000))));
-        assert!(matches!(Instruction::from_byte(0xcf, false), Ok(Instruction::Rst(0x0008))));
-        assert!(matches!(Instruction::from_byte(0xd7, false), Ok(Instruction::Rst(0x0010))));
-        assert!(matches!(Instruction::from_byte(0xdf, false), Ok(Instruction::Rst(0x0018))));
-        assert!(matches!(Instruction::from_byte(0xe7, false), Ok(Instruction::Rst(0x0020))));
-        assert!(matches!(Instruction::from_byte(0xef, false), Ok(Instruction::Rst(0x0028))));
-        assert!(matches!(Instruction::from_byte(0xf7, false), Ok(Instruction::Rst(0x0030))));
-        assert!(matches!(Instruction::from_byte(0xff, false), Ok(Instruction::Rst(0x0038))));
     }
 }
