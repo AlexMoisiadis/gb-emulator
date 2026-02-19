@@ -56,10 +56,11 @@ pub enum LoadByteTarget {
     E,
     H,
     L,
-    HLI, // legacy placeholder for (HL) if you need it
+    HLI,
     MemReg16(Reg16), // (BC), (DE), (HL)
-    MemImm8, // (a8)
+    MemImm8, // (FF00 + a8)
     MemImm16, // (a16)
+    MemHighC, // (FF00 + C)   <-- NEW
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,10 +73,11 @@ pub enum LoadByteSource {
     H,
     L,
     D8,
-    HLI, // legacy placeholder for (HL)
+    HLI,
     MemReg16(Reg16), // (BC), (DE), (HL)
-    MemImm8, // (a8)
+    MemImm8, // (FF00 + a8)
     MemImm16, // (a16)
+    MemHighC, // (FF00 + C)   <-- NEW
 }
 
 #[derive(Debug, Clone, Copy)]
