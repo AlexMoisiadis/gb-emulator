@@ -47,6 +47,18 @@ pub struct Registers {
 
 impl Registers {
     #[inline]
+    pub fn get_af(&self) -> u16 {
+        let f: u8 = self.f.into();
+        ((self.a as u16) << 8) | (f as u16)
+    }
+    #[inline]
+    pub fn set_af(&mut self, value: u16) {
+        self.a = (value >> 8) as u8;
+        let f_byte = (value & 0x00ff) as u8;
+        self.f = FlagsRegister::from(f_byte);
+    }
+
+    #[inline]
     pub fn get_bc(&self) -> u16 {
         ((self.b as u16) << 8) | (self.c as u16)
     }

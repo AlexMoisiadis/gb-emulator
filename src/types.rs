@@ -14,6 +14,8 @@ pub enum ArithmeticTarget {
 pub enum StackTarget {
     BC,
     DE,
+    HL,
+    AF,
 }
 
 #[derive(Debug, Clone, Copy)]
