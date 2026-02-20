@@ -4,6 +4,8 @@ use gb_emulator::gpu::DebugOverlayConfig;
 
 use pixels::{ Pixels, SurfaceTexture };
 use std::sync::Arc;
+use std::{ fs::File, path::Path };
+use png::{ Encoder, ColorType, BitDepth };
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -34,6 +36,7 @@ struct App {
     o_sprites: bool,
     prev_ly: u8, // Last LY we saw (0.=153)
     in_vblank: bool,
+    screenshot_id: u32,
 }
 
 impl App {
@@ -62,7 +65,31 @@ impl App {
             o_sprites,
             prev_ly: 0,
             in_vblank: false,
+            screenshot_id: 0,
         })
+    }
+
+    fn save_png<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
+        const W: usize = 160;
+        const H: usize = 144;
+
+        // Convert shade indices (0..3) to 8-bit grayscale.
+        let lut: [u8; 4] = [0xff, 0xaa, 0x55, 0x00]; // white..black
+        let mut gray = vec![0u8; W * H];
+        for y in 0..H {
+            for x in 0..W {
+                let idx = self.fb[y][x] as usize;
+                gray[y * W + x] = lut.get(idx).copied().unwrap_or(0x00);
+            }
+        }
+
+        let file = File::create(path.as_ref())?;
+        let mut enc = Encoder::new(file, W as u32, H as u32);
+        enc.set_color(ColorType::Grayscale);
+        enc.set_depth(BitDepth::Eight);
+        let mut writer = enc.write_header()?;
+        writer.write_image_data(&gray)?;
+        Ok(())
     }
 
     fn window_id(&self) -> Option<WindowId> {
@@ -201,6 +228,14 @@ impl ApplicationHandler for App {
                         }
                         PhysicalKey::Code(KeyCode::KeyS) => {
                             self.o_sprites = !self.o_sprites;
+                        }
+                        PhysicalKey::Code(KeyCode::F9) => {
+                            self.screenshot_id = self.screenshot_id.wrapping_add(1);
+                            let filename = format!("acid2-capture-{:03}.png", self.screenshot_id);
+                            match self.save_png(&filename) {
+                                Ok(()) => eprintln!("Saved {}", filename),
+                                Err(e) => eprintln!("Save failed: {e}"),
+                            }
                         }
                         PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
                         _ => {}

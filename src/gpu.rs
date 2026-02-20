@@ -314,13 +314,14 @@ impl GPU {
         // LCDC gates
         let lcd_on = (self.lcdc & 0x80) != 0;
         let bg_on = (self.lcdc & 0x01) != 0;
-        let win_on = (self.lcdc & 0x20) != 0; // Window enable (bit5)
-        let use_8000 = (self.lcdc & 0x10) != 0; // Tile data select: 1=0x8000 unsigned; 0=0x8800 signed
+        let win_on = (self.lcdc & 0x20) != 0; // (unused here, just showing context)
+        let use_8000 = (self.lcdc & 0x10) != 0;
 
         if !lcd_on || !bg_on {
-            // If LCD or BG is off, fill with color 0 (as per DMG behavior)
+            // Fill with BG color 0 and mark BG indices as 0 for OBJ priority.
             let c0 = self.map_bgp(TilePixelValue::Zero);
             out.fill(c0);
+            self.bg_idx_line.fill(0); // <-- IMPORTANT: clear raw BG indices
             return;
         }
 
