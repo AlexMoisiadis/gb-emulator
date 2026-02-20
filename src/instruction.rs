@@ -21,6 +21,9 @@ pub enum Instruction {
     CALL(JumpTest),
     RET(JumpTest),
 
+    // indirect jump HL
+    JPHL,
+
     // Loads (generic 8-bit)
     LD(LoadType),
 
@@ -285,6 +288,9 @@ impl Instruction {
             }
             0xf9 => {
                 return Ok(Instruction::LdSpHl);
+            }
+            0xe9 => {
+                return Ok(Instruction::JPHL);
             }
 
             // Unconditional control flow

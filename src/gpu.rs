@@ -416,7 +416,8 @@ impl GPU {
     }
 
     /// Overlay OBJ (sprites) on top of the already-drawn BG/Window for scanline `ly`.
-    /// `out` holds DMG shades (0..3). Uses `bg_idx_line` for OBJ↔BG priority decisions.
+    /// `out` holds DMG shades (0..3). Uses `bg_idx_line` for OBJ↔BG priority.
+    /// DMG OBJ→OBJ priority: smaller X in front; ties -> lower OAM index.  [Pan Docs / gbdev]
     pub fn render_scanline_objs(&self, ly: u8, out: &mut [u8; LCD_WIDTH]) {
         // OBJ rendering enabled only if LCD is on and OBJ enable (LCDC bit1)
         let lcd_on = (self.lcdc & 0x80) != 0;
@@ -431,14 +432,10 @@ impl GPU {
         // 1) Select up to 10 sprites that intersect this scanline, in OAM order.
         let mut selected: [usize; 10] = [usize::MAX; 10];
         let mut count = 0usize;
-
         for i in 0..40 {
             let base = i * 4;
             let oam_y = self.oam[base] as i16;
-
             let y = oam_y - 16; // on-screen Y
-
-            // If sprite intersects ly (within its height)
             let ly_i16 = ly as i16;
             if ly_i16 >= y && ly_i16 < y + obj_h {
                 selected[count] = i;
@@ -448,17 +445,41 @@ impl GPU {
                 }
             }
         }
-
         if count == 0 {
             return;
         }
 
-        // 2) Draw sprites in **reverse OAM order** among the selected set,
-        //    so lower OAM index (higher priority) is drawn **last** (on top).
-        for si in (0..count).rev() {
+        // 2) DMG OBJ→OBJ priority among the selected set:
+        //    smaller X wins (front), tie -> lower OAM index.
+        //    We'll sort by (x asc, idx asc), then draw in reverse (back-to-front),
+        //    so that the "frontmost" sprite is drawn last.
+        let mut order: [(usize, i16); 10] = [(usize::MAX, 0); 10];
+        for si in 0..count {
             let i = selected[si];
             let base = i * 4;
+            let oam_x = self.oam[base + 1] as i16;
+            let x = oam_x - 8; // on-screen X (can be <0 or >=160 but still participates in priority)
+            order[si] = (i, x);
+        }
+        // Simple selection sort over the first `count` entries
+        for a in 0..count {
+            let mut min = a;
+            for b in a + 1..count {
+                let (i_b, x_b) = order[b];
+                let (i_m, x_m) = order[min];
+                if x_b < x_m || (x_b == x_m && i_b < i_m) {
+                    min = b;
+                }
+            }
+            if min != a {
+                order.swap(a, min);
+            }
+        }
 
+        // 3) Draw in reverse sorted order (back-to-front).
+        for si in (0..count).rev() {
+            let (i, _) = order[si];
+            let base = i * 4;
             let oam_y = self.oam[base] as i16;
             let oam_x = self.oam[base + 1] as i16;
             let tile = self.oam[base + 2];
@@ -479,8 +500,8 @@ impl GPU {
             }
 
             // Resolve tile index and row within the tile cache.
-            // DMG OBJ always uses the 0x8000 tile set (unsigned indices 0..255).
-            // For 8x16, the base tile is even; line>=8 uses the next tile.
+            // DMG OBJ always uses 0x8000 tile data (unsigned indices 0..255).
+            // In 8x16, the base tile is even; lines >= 8 use the next tile.
             let (tile_index, row_in_tile) = if obj_8x16 {
                 let base_even = (tile & 0xfe) as usize;
                 if line >= 8 {
@@ -497,7 +518,7 @@ impl GPU {
                 continue;
             }
 
-            // For each of the 8 pixels in the tile row
+            // For each pixel in the tile row
             for px in 0..8 {
                 let screen_x = x + ((if xflip { 7 - px } else { px }) as i16);
                 if screen_x < 0 || screen_x >= (LCD_WIDTH as i16) {
@@ -505,10 +526,10 @@ impl GPU {
                 }
                 let sx = screen_x as usize;
 
-                // Fetch OBJ pixel (raw index 0..3)
+                // OBJ pixel (0..3), 0 is transparent
                 let obj_px = self.tile_set[tile_index][row_in_tile][px as usize];
                 let obj_idx = match obj_px {
-                    TilePixelValue::Zero => 0, // transparent; skip
+                    TilePixelValue::Zero => 0,
                     TilePixelValue::One => 1,
                     TilePixelValue::Two => 2,
                     TilePixelValue::Three => 3,
@@ -517,12 +538,12 @@ impl GPU {
                     continue; // transparent
                 }
 
-                // BG↔OBJ priority: if behind_bg=1, sprite is behind BG UNLESS BG index is 0.
+                // BG↔OBJ priority: if behind_bg=1, sprite is behind BG unless BG color index is 0.
                 if behind_bg && self.bg_idx_line[sx] != 0 {
-                    continue; // BG pixel is nonzero; sprite stays behind
+                    continue;
                 }
 
-                // Map through OBP0/1 (DMG)
+                // Map through OBP0/OBP1 (DMG)
                 let shade = self.map_obp(obj_idx, use_obp1);
                 out[sx] = shade;
             }

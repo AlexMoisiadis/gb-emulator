@@ -17,6 +17,9 @@ const W: usize = 160;
 const H: usize = 144;
 type Framebuffer = [[u8; W]; H];
 
+const LY_ADDR: u16 = 0xff44; // LY register
+const STAT_ADDR: u16 = 0xff41; // STAT register; bits[1:0] = mode (0..3)
+const FRAME_DOTS: u32 = 70_224; // 154 * 456  (≈59.7 Hz)  [1](https://www.reddit.com/r/EmuDev/comments/10orf0d/question_about_the_gameboy_window_xcoordinate/)
 struct App {
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
@@ -29,6 +32,8 @@ struct App {
     o_window: bool,
     o_axes: bool,
     o_sprites: bool,
+    prev_ly: u8, // Last LY we saw (0.=153)
+    in_vblank: bool,
 }
 
 impl App {
@@ -55,6 +60,8 @@ impl App {
             o_window,
             o_axes,
             o_sprites,
+            prev_ly: 0,
+            in_vblank: false,
         })
     }
 
@@ -120,42 +127,66 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                // Step emulation (very rough pacing)
-                for _ in 0..20_000 {
-                    self.cpu.step(&mut self.bus);
-                }
-                self.bus.render_frame(&mut self.fb);
+                // Step until we hit the **start** of VBlank (LY edge 143->144) exactly once
+                let mut safety = 0u32;
+                let mut presented = false;
 
-                // Upload to pixels
-                if let Some(pixels) = &mut self.pixels {
-                    let frame = pixels.frame_mut();
-                    for y in 0..H {
-                        for x in 0..W {
-                            let v = match self.fb[y][x] & 0b11 {
-                                0 => 255,
-                                1 => 170,
-                                2 => 85,
-                                _ => 0,
-                            };
-                            let i = (y * W + x) * 4;
-                            frame[i + 0] = v;
-                            frame[i + 1] = v;
-                            frame[i + 2] = v;
-                            frame[i + 3] = 0xff;
+                while !presented && safety < FRAME_DOTS {
+                    let cy = self.cpu.step(&mut self.bus);
+                    safety = safety.saturating_add(cy);
+
+                    let ly = self.bus.read_byte(LY_ADDR);
+                    let stat = self.bus.read_byte(STAT_ADDR);
+                    let mode = stat & 0b11; // STAT mode: 0=HBlank,1=VBlank,2=OAM,3=Transfer  [1](https://www.reddit.com/r/EmuDev/comments/10orf0d/question_about_the_gameboy_window_xcoordinate/)
+
+                    // Detect **rising edge** into VBlank: LY 143->144 OR mode changed to 1
+                    let vblank_now = ly == 144 || mode == 0b01;
+                    if !self.in_vblank && vblank_now {
+                        // We just **entered** VBlank -> present exactly once
+                        self.in_vblank = true;
+
+                        // Take stable snapshot
+                        self.bus.render_frame(&mut self.fb);
+
+                        if let Some(pixels) = &mut self.pixels {
+                            let frame = pixels.frame_mut();
+                            for y in 0..H {
+                                for x in 0..W {
+                                    let v = match self.fb[y][x] & 0b11 {
+                                        0 => 255,
+                                        1 => 170,
+                                        2 => 85,
+                                        _ => 0,
+                                    };
+                                    let i = (y * W + x) * 4;
+                                    frame[i + 0] = v;
+                                    frame[i + 1] = v;
+                                    frame[i + 2] = v;
+                                    frame[i + 3] = 0xff;
+                                }
+                            }
+                            if let Err(e) = pixels.render() {
+                                eprintln!("pixels.render() failed: {e}");
+                                event_loop.exit();
+                                return;
+                            }
                         }
+                        presented = true;
                     }
-                    if pixels.render().is_err() {
-                        eprintln!("pixels.render() failed; exiting");
-                        event_loop.exit();
-                        return;
+
+                    // Detect **exit** from VBlank for the *next* frame: LY < 144 and mode != 1
+                    if ly < 144 && mode != 0b01 {
+                        self.in_vblank = false;
                     }
+
+                    self.prev_ly = ly;
                 }
 
-                // Request next frame (simple continuous redraw)
                 if let Some(win) = &self.window {
                     win.request_redraw();
                 }
             }
+
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key, state, .. }, .. } => {
                 if state == ElementState::Pressed {
                     match physical_key {

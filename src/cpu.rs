@@ -1080,6 +1080,11 @@ impl CPU {
                 }
             }
 
+            Instruction::JPHL => {
+                self.pc = self.regs.get_hl();
+                4
+            }
+
             // ---------- PUSH / POP ----------
             Instruction::POP(StackTarget::BC) => {
                 let v = self.pop16(bus);
