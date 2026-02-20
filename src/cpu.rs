@@ -1,7 +1,5 @@
 // src/cpu.rs
 
-// src/cpu.rs
-
 // --- Tiny macros to reduce repetition for register-only cases ---
 
 /// INC r: apply alu_inc8 to a register and return 4 cycles.
@@ -42,9 +40,9 @@ use crate::types::{
     LoadByteSource,
     LoadByteTarget,
     LoadType,
+    PrefixTarget,
     Reg16,
     StackTarget,
-    PrefixTarget,
 };
 
 // In struct CPU (add one field)
@@ -55,6 +53,9 @@ pub struct CPU {
     pub ime: bool,
     pub halted: bool,
     ei_delay: u8, // NEW: counts down instructions after EI
+    trace: bool,
+    last_pc: u16,
+    last_op: u8,
 }
 
 impl CPU {
@@ -72,7 +73,77 @@ impl CPU {
             ime: false,
             halted: false,
             ei_delay: 0, // NEW
+            trace: false,
+            last_pc: 0,
+            last_op: 0,
         }
+    }
+
+    #[inline]
+    pub fn set_trace(&mut self, enabled: bool) {
+        self.trace = enabled;
+    }
+
+    // NEW:
+    #[inline]
+    fn trace_insn(&self, pc: u16, op: u8, cb_extra: Option<u8>) {
+        if !self.trace {
+            return;
+        }
+        let af = self.regs.get_af();
+        let bc = self.regs.get_bc();
+        let de = self.regs.get_de();
+        let hl = self.regs.get_hl();
+
+        match cb_extra {
+            Some(cb) => {
+                println!(
+                    "PC={:04X} OP={:02X} CB={:02X} | AF={:04X} BC={:04X} DE={:04X} HL={:04X} SP={:04X} IME={} HALT={}",
+                    pc,
+                    op,
+                    cb,
+                    af,
+                    bc,
+                    de,
+                    hl,
+                    self.sp,
+                    self.ime as u8,
+                    self.halted as u8
+                );
+            }
+            None => {
+                println!(
+                    "PC={:04X} OP={:02X}      | AF={:04X} BC={:04X} DE={:04X} HL={:04X} SP={:04X} IME={} HALT={}",
+                    pc,
+                    op,
+                    af,
+                    bc,
+                    de,
+                    hl,
+                    self.sp,
+                    self.ime as u8,
+                    self.halted as u8
+                );
+            }
+        }
+    }
+
+    #[inline]
+    fn log_regs(&self, context: &str) {
+        let af = self.regs.get_af();
+        let bc = self.regs.get_bc();
+        let de = self.regs.get_de();
+        let hl = self.regs.get_hl();
+        println!("{}  AF={:04X}  BC={:04X}  DE={:04X}  HL={:04X}", context, af, bc, de, hl);
+    }
+
+    #[inline]
+    fn write_byte_with_ff50_log(&self, bus: &mut MemoryBus, addr: u16, val: u8) {
+        if addr == 0xff50 {
+            // Reuse your existing logger
+            self.log_regs("FF50 write:");
+        }
+        bus.write_byte(addr, val);
     }
 
     #[inline]
@@ -395,17 +466,37 @@ impl CPU {
             }
         }
 
-        // Fetch, decode, execute
+        // Fetch opcode
+        let pc_before = self.pc;
         let op = self.fetch8(bus);
+        self.last_pc = pc_before;
+        self.last_op = op;
+
         if op == 0xcb {
             let cb = self.fetch8(bus);
+            // TRACE (CB-prefixed)
+            self.trace_insn(pc_before, op, Some(cb));
+
             match Instruction::from_byte(cb, true) {
-                Ok(insn) => self.exec(insn, bus),
+                Ok(insn) => {
+                    if self.trace {
+                        println!("    => {}", insn.mnemonic());
+                    }
+                    self.exec(insn, bus)
+                }
                 Err(e) => self.trap_unknown(e),
             }
         } else {
+            // TRACE (non-CB)
+            self.trace_insn(pc_before, op, None);
+
             match Instruction::from_byte(op, false) {
-                Ok(insn) => self.exec(insn, bus),
+                Ok(insn) => {
+                    if self.trace {
+                        println!("    => {}", insn.mnemonic());
+                    }
+                    self.exec(insn, bus)
+                }
                 Err(e) => self.trap_unknown(e),
             }
         }
@@ -582,24 +673,30 @@ impl CPU {
             }
             LoadByteTarget::MemImm16 => {
                 let addr = self.fetch16(bus);
-                bus.write_byte(addr, val);
+                // OLD: bus.write_byte(addr, val);
+                self.write_byte_with_ff50_log(bus, addr, val);
             }
             LoadByteTarget::MemImm8 => {
                 let lo = self.fetch8(bus) as u16;
                 let addr = 0xff00 | lo;
-                bus.write_byte(addr, val);
+                // OLD: bus.write_byte(addr, val);
+                self.write_byte_with_ff50_log(bus, addr, val);
             }
             LoadByteTarget::MemHighC => {
                 let addr = 0xff00 | (self.regs.c as u16);
-                bus.write_byte(addr, val);
+                // OLD: bus.write_byte(addr, val);
+                self.write_byte_with_ff50_log(bus, addr, val);
             }
             LoadByteTarget::HLI => {
                 let addr = self.regs.get_hl();
                 bus.write_byte(addr, val);
             }
             // AF, SP, PC not valid byte targets via this enum
+
             LoadByteTarget::MemReg16(_) => {
-                self.trap_unknown(DecodeError::UnknownOpcode(0x00, false))
+                // NEW: show which one before trapping
+                eprintln!("write_to_target: UNHANDLED tgt = {:?}", tgt);
+                self.trap_unknown(DecodeError::UnknownOpcode(0x00, false));
             }
         }
     }
@@ -644,7 +741,9 @@ impl CPU {
                 bus.read_byte(addr)
             }
             LoadByteSource::MemReg16(_) => {
-                self.trap_unknown(DecodeError::UnknownOpcode(0x00, false))
+                // NEW: show which one before trapping
+                eprintln!("read_from_source: UNHANDLED src = {:?}", src);
+                self.trap_unknown(DecodeError::UnknownOpcode(0x00, false));
             }
         }
     }
@@ -812,25 +911,33 @@ impl CPU {
             }
 
             // ---------- LD r,d8 (explicit to ensure 8 cycles) ----------
-            Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::D8)) =>
-                ld_d8!(self, bus, a),
-            Instruction::LD(LoadType::Byte(LoadByteTarget::B, LoadByteSource::D8)) =>
-                ld_d8!(self, bus, b),
-            Instruction::LD(LoadType::Byte(LoadByteTarget::C, LoadByteSource::D8)) =>
-                ld_d8!(self, bus, c),
-            Instruction::LD(LoadType::Byte(LoadByteTarget::D, LoadByteSource::D8)) =>
-                ld_d8!(self, bus, d),
-            Instruction::LD(LoadType::Byte(LoadByteTarget::E, LoadByteSource::D8)) =>
-                ld_d8!(self, bus, e),
-            Instruction::LD(LoadType::Byte(LoadByteTarget::H, LoadByteSource::D8)) =>
-                ld_d8!(self, bus, h),
-            Instruction::LD(LoadType::Byte(LoadByteTarget::L, LoadByteSource::D8)) =>
-                ld_d8!(self, bus, l),
+            Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::D8)) => {
+                ld_d8!(self, bus, a)
+            }
+            Instruction::LD(LoadType::Byte(LoadByteTarget::B, LoadByteSource::D8)) => {
+                ld_d8!(self, bus, b)
+            }
+            Instruction::LD(LoadType::Byte(LoadByteTarget::C, LoadByteSource::D8)) => {
+                ld_d8!(self, bus, c)
+            }
+            Instruction::LD(LoadType::Byte(LoadByteTarget::D, LoadByteSource::D8)) => {
+                ld_d8!(self, bus, d)
+            }
+            Instruction::LD(LoadType::Byte(LoadByteTarget::E, LoadByteSource::D8)) => {
+                ld_d8!(self, bus, e)
+            }
+            Instruction::LD(LoadType::Byte(LoadByteTarget::H, LoadByteSource::D8)) => {
+                ld_d8!(self, bus, h)
+            }
+            Instruction::LD(LoadType::Byte(LoadByteTarget::L, LoadByteSource::D8)) => {
+                ld_d8!(self, bus, l)
+            }
 
             // ---------- Absolute addressing ----------
             Instruction::LD(LoadType::Byte(LoadByteTarget::MemImm16, LoadByteSource::A)) => {
                 let addr = self.fetch16(bus);
-                bus.write_byte(addr, self.regs.a);
+                // OLD: bus.write_byte(addr, self.regs.a);
+                self.write_byte_with_ff50_log(bus, addr, self.regs.a);
                 16
             }
             Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemImm16)) => {
@@ -841,6 +948,7 @@ impl CPU {
 
             // ---------- High-RAM I/O: (FF00+a8), (FF00+C) ----------
             Instruction::LD(LoadType::Byte(LoadByteTarget::MemImm8, LoadByteSource::A)) => {
+                // This path calls write_to_target() which we will patch below to log when addr==FF50
                 self.write_to_target(bus, LoadByteTarget::MemImm8, self.regs.a);
                 12
             }
@@ -851,7 +959,8 @@ impl CPU {
             }
             Instruction::LD(LoadType::Byte(LoadByteTarget::MemHighC, LoadByteSource::A)) => {
                 let addr = 0xff00 | (self.regs.c as u16);
-                bus.write_byte(addr, self.regs.a);
+                // OLD: bus.write_byte(addr, self.regs.a);
+                self.write_byte_with_ff50_log(bus, addr, self.regs.a);
                 8
             }
             Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemHighC)) => {
@@ -1026,8 +1135,20 @@ impl CPU {
             Instruction::SRL(t) => self.cb_rw(bus, t, CPU::op_srl),
             Instruction::SWAP(t) => self.cb_rw(bus, t, CPU::op_swap),
 
-            Instruction::BIT(bit, t) =>
-                self.cb_read_only(bus, t, |cpu, v| cpu.cb_bit_test_flags(bit, v)),
+            Instruction::BIT(bit, t) => {
+                let cycles = self.cb_read_only(bus, t, |cpu, v| cpu.cb_bit_test_flags(bit, v));
+
+                if self.trace && bit == 7 && matches!(t, PrefixTarget::H) {
+                    if self.regs.f.zero {
+                        println!(
+                            "Boot clear-down loop complete: HL crossed below 0x8000 (HL={:04X})",
+                            self.regs.get_hl()
+                        );
+                    }
+                }
+
+                cycles
+            }
             Instruction::RES(bit, t) => self.cb_rw(bus, t, |_, v| CPU::cb_bit_res(v, bit)),
             Instruction::SET(bit, t) => self.cb_rw(bus, t, |_, v| CPU::cb_bit_set(v, bit)),
 
@@ -1048,6 +1169,42 @@ impl CPU {
                 self.pc = addr;
                 self.ime = true;
                 16
+            }
+
+            Instruction::INC(IncDecTarget::DE) => {
+                let v = self.regs.get_de().wrapping_add(1);
+                self.regs.set_de(v);
+                8
+            }
+            Instruction::INC(IncDecTarget::HL) => {
+                let v = self.regs.get_hl().wrapping_add(1);
+                self.regs.set_hl(v);
+                8
+            }
+            Instruction::INC(IncDecTarget::SP) => {
+                self.sp = self.sp.wrapping_add(1);
+                8
+            }
+
+            // ---------- 16-bit DEC ----------
+            Instruction::DEC(IncDecTarget::BC) => {
+                let v = self.regs.get_bc().wrapping_sub(1);
+                self.regs.set_bc(v);
+                8
+            }
+            Instruction::DEC(IncDecTarget::DE) => {
+                let v = self.regs.get_de().wrapping_sub(1);
+                self.regs.set_de(v);
+                8
+            }
+            Instruction::DEC(IncDecTarget::HL) => {
+                let v = self.regs.get_hl().wrapping_sub(1);
+                self.regs.set_hl(v);
+                8
+            }
+            Instruction::DEC(IncDecTarget::SP) => {
+                self.sp = self.sp.wrapping_sub(1);
+                8
             }
 
             // ---------- Fallback ----------
@@ -1079,6 +1236,6 @@ impl CPU {
     }
 
     fn trap_unknown(&self, e: DecodeError) -> ! {
-        panic!("Unknown or unhandled instruction: {:?}", e);
+        panic!("TRAP: pc={:04X} op={:02X} err={:?}", self.last_pc, self.last_op, e);
     }
 }

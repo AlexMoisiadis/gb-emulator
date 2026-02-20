@@ -1,70 +1,201 @@
+// /bin/emulator.rs
+
+#[derive(Default, Clone, Copy)]
+struct OverlayArgs {
+    grid: bool,
+    window: bool,
+    axes: bool,
+    sprites: bool,
+}
+
 use gb_emulator::{ CPU, MemoryBus };
+use gb_emulator::gpu::DebugOverlayConfig;
+use std::{ env, fs, process };
+
+mod util {
+    pub mod image;
+}
+use util::image::{ write_pgm, write_ppm, Framebuffer };
 
 fn main() {
+    // ---- Parse CLI ----
+    // Examples:
+    //   emulator --boot dmg_boot.bin --rom dmg-acid2.gb
+    //   emulator --rom tetris.gb
+    let mut args = env::args().skip(1);
+    let mut boot_path: Option<String> = None;
+    let mut rom_path: Option<String> = None;
+    let mut overlay: OverlayArgs = OverlayArgs::default();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--boot" => {
+                boot_path = args.next();
+            }
+            "--rom" => {
+                rom_path = args.next();
+            }
+            "--overlay" => {
+                if let Some(list) = args.next() {
+                    overlay = parse_overlay_list(&list)
+                        .map_err(|e| {
+                            eprintln!("Invalid --overlay: {e}");
+                            e
+                        })
+                        .unwrap_or_else(|_| {
+                            // fall back to no overlays on error
+                            OverlayArgs::default()
+                        });
+                } else {
+                    eprintln!("--overlay requires a value, e.g. --overlay grid,window,sprites");
+                }
+            }
+            _ => eprintln!("Unknown arg: {arg}"),
+        }
+    }
+
+    let rom_path = rom_path.unwrap_or_else(|| {
+        eprintln!(
+            "Usage: emulator --rom <path.gb> [--boot <dmg_boot.bin>] [--overlay grid,window,axes,sprites]"
+        );
+        process::exit(1);
+    });
+
+    let rom = fs::read(&rom_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read ROM '{}': {}", rom_path, e);
+        process::exit(1);
+    });
+
+    // ---- Wire up CPU / Bus ----
     let mut cpu = CPU::new();
     let mut bus = MemoryBus::new();
 
-    // 0000: 06 17        LD B,0x17
-    // 0002: 3E 42        LD A,0x42
-    // 0004: EA 00 80     LD (0x8000),A
-    // 0007: CD 0B 00     CALL 0x000B
-    // 000A: C3 0A 00     JP 0x000A
-    // 000B: 03           INC BC
-    // 000C: C9           RET
+    // NEW: enable trace via environment variable
+    let trace_enabled = std::env::var("GB_TRACE").ok().as_deref() == Some("1");
+    cpu.set_trace(trace_enabled);
 
-    let rom: [u8; 16] = [
-        0x06,
-        0x17, // 0000: LD B,0x17
-        0x3e,
-        0x42, // 0002: LD A,0x42
-        0xea,
-        0x00,
-        0x80, // 0004: LD (0x8000),A
-        0xcd,
-        0x0b,
-        0x00, // 0007: CALL 0x000B
-        0x03, // 000A: (unused; safe filler)
-        0x03, // 000B: INC BC
-        0xc9, // 000C: RET
-        0xc3,
-        0x0d,
-        0x00, // 000D: JP 0x000D
-    ];
+    // Optional: user-supplied DMG boot ROM (256 bytes)
+    if let Some(bp) = boot_path {
+        match fs::read(&bp) {
+            Ok(bytes) if bytes.len() == 0x100 => {
+                bus.load_boot_rom(bytes);
+                println!("Loaded DMG boot ROM from '{}'", bp);
+                cpu.pc = 0x0000; // start at boot ROM
+            }
+            Ok(bytes) => {
+                eprintln!(
+                    "Boot ROM '{}' is {} bytes; expected 256 (DMG). Skipping boot ROM.",
+                    bp,
+                    bytes.len()
+                );
+                post_boot_init(&mut cpu, &mut bus);
+            }
+            Err(e) => {
+                eprintln!("Failed to read boot ROM '{}': {}. Skipping boot ROM.", bp, e);
+                post_boot_init(&mut cpu, &mut bus);
+            }
+        }
+    } else {
+        post_boot_init(&mut cpu, &mut bus);
+    }
+
+    apply_overlay(&mut bus, overlay);
+
+    // Load cartridge (no MBC => first 32 KiB)
     bus.load_rom(&rom);
 
-    cpu.pc = 0x0000;
-    cpu.regs.set_bc(0x0000);
+    // ---- Run a little, then render a frame ----
+    // (Soon you’ll interleave CPU cycles with PPU tick)
+    for _ in 0..20_000 {
+        cpu.step(&mut bus);
+    }
 
-    // Print first 7 bytes so we also see the 0x80 from the a16 operand
-    println!("mem[0000..0007] = {:02X?}", (0..7).map(|i| bus.read_byte(i)).collect::<Vec<_>>());
+    let mut fb: Framebuffer = [[0; 160]; 144];
+    bus.render_frame(&mut fb);
 
-    // Step 1: LD B,0x17
-    cpu.step(&mut bus);
-    assert_eq!(cpu.regs.b, 0x17);
-    assert_eq!(cpu.regs.get_bc(), 0x1700);
+    // Write PGM (grayscale, tiny)
+    if let Err(e) = write_pgm("frame_overlay.pgm", &fb) {
+        eprintln!("PGM write failed: {e}");
+    } else {
+        println!("Wrote frame_overlay.pgm");
+    }
 
-    // Step 2: LD A,0x42
-    cpu.step(&mut bus);
-    assert_eq!(cpu.regs.a, 0x42);
+    // Or write PPM with default grayscale palette
+    if let Err(e) = write_ppm("frame_overlay.ppm", &fb, None) {
+        eprintln!("PPM write failed: {e}");
+    } else {
+        println!("Wrote frame_overlay.ppm");
+    }
 
-    // Step 3: LD (0x8000),A
-    cpu.step(&mut bus);
-    assert_eq!(bus.read_byte(0x8000), 0x42);
+    // Or PPM with the alternate high-contrast palette (makes overlays pop)
+    if let Err(e) = write_ppm("frame_overlay_hicon.ppm", &fb, Some(util::image::HIGH_CONTRAST_PAL)) {
+        eprintln!("PPM write failed: {e}");
+    }
+    // Small diagnostics
+    let ly = bus.read_byte(0xff44);
+    let stat = bus.read_byte(0xff41);
+    let iflg = bus.read_byte(0xff0f);
+    println!("Rendered 1 frame. LY={ly}, STAT=0b{stat:08b}, IF=0b{iflg:08b}");
+}
 
-    // Step 4: CALL 0x000B
-    cpu.step(&mut bus);
+/// Fallback to “post‑boot” state if no boot ROM is provided.
+/// Typical DMG values; exact list comes from boot behavior and legacy docs. [4](https://gbdev.gg8.se/wiki/articles/Power_Up_Sequence)
+fn apply_overlay(bus: &mut MemoryBus, oa: OverlayArgs) {
+    let mut cfg = DebugOverlayConfig::default();
+    cfg.show_bg_tile_grid = oa.grid;
+    cfg.show_window_bounds = oa.window;
+    cfg.show_bg_axes = oa.axes;
+    cfg.show_sprite_boxes = oa.sprites;
 
-    // Step 5: INC BC (in subroutine)
-    cpu.step(&mut bus);
+    // High-contrast DMG shades (0..3)
+    cfg.shade_grid = 3; // black
+    cfg.shade_window = 2; // dark gray
+    cfg.shade_axes = 1; // light gray
+    cfg.shade_sprite_box = 3; // black
 
-    // Step 6: RET (back to 0x000A)
-    cpu.step(&mut bus);
+    bus.set_gpu_debug_config(cfg);
+}
+fn post_boot_init(cpu: &mut CPU, bus: &mut MemoryBus) {
+    // CPU registers
+    cpu.regs.set_af(0x01b0); // A=0x01, F=0xB0 (uses your existing code)
+    cpu.regs.set_bc(0x0013);
+    cpu.regs.set_de(0x00d8);
+    cpu.regs.set_hl(0x014d);
+    cpu.sp = 0xfffe;
+    cpu.pc = 0x0100;
 
-    // Now BC should be 0x1701
-    assert_eq!(cpu.regs.get_bc(), 0x1701);
+    // PPU defaults commonly set by boot ROM
+    bus.write_byte(0xff40, 0x91); // LCDC
+    bus.write_byte(0xff42, 0x00); // SCY
+    bus.write_byte(0xff43, 0x00); // SCX
+    bus.write_byte(0xff47, 0xfc); // BGP
+    bus.write_byte(0xff4a, 0x00); // WY
+    bus.write_byte(0xff4b, 0x00); // WX
+}
 
-    // Step 7: JP 0x000A (self-loop)
-    cpu.step(&mut bus);
-
-    println!("All assertions passed.");
+fn parse_overlay_list(s: &str) -> Result<OverlayArgs, String> {
+    let mut oa = OverlayArgs::default();
+    for tok in s.split(',').map(|t| t.trim().to_ascii_lowercase()) {
+        if tok.is_empty() {
+            continue;
+        }
+        match tok.as_str() {
+            "grid" => {
+                oa.grid = true;
+            }
+            "window" => {
+                oa.window = true;
+            }
+            "axes" => {
+                oa.axes = true;
+            }
+            "sprites" => {
+                oa.sprites = true;
+            }
+            other => {
+                return Err(format!("unknown overlay token: '{other}'"));
+            }
+        }
+    }
+    Ok(oa)
 }

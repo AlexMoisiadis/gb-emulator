@@ -29,7 +29,12 @@ impl From<u8> for FlagsRegister {
         let subtract = ((byte >> SUBTRACT_FLAG_BYTE_POSITION) & 0b1) != 0;
         let half_carry = ((byte >> HALF_CARRY_FLAG_BYTE_POSITION) & 0b1) != 0;
         let carry = ((byte >> CARRY_FLAG_BYTE_POSITION) & 0b1) != 0;
-        FlagsRegister { zero, subtract, half_carry, carry }
+        FlagsRegister {
+            zero,
+            subtract,
+            half_carry,
+            carry,
+        }
     }
 }
 

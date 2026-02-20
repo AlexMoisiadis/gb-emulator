@@ -80,7 +80,7 @@ impl Timer {
             0xff04 => self.divider,
             0xff05 => self.tima,
             0xff06 => self.tma,
-            0xff07 =>
+            0xff07 => {
                 0xf8 |
                     (if self.enabled { 0x4 } else { 0 }) |
                     (match self.tac & 0b11 {
@@ -89,7 +89,8 @@ impl Timer {
                         0b10 => 2,
                         0b11 => 3,
                         _ => 0,
-                    }),
+                    })
+            }
             _ => 0xff,
         }
     }
