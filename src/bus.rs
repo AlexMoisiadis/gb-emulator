@@ -24,9 +24,6 @@ pub struct MemoryBus {
     pub mmu: MMU,
     pub gpu: GPU,
     timer: Timer,
-
-    ppu_dots: u32, // accumulated “dots” (T-cycles)
-    ly: u8, // current scanline 0..153
 }
 
 impl MemoryBus {
@@ -35,8 +32,6 @@ impl MemoryBus {
             mmu: MMU::new(),
             gpu: GPU::new(),
             timer: Timer::new(),
-            ppu_dots: 0,
-            ly: 0,
         }
     }
 
@@ -148,43 +143,16 @@ impl MemoryBus {
     #[inline]
     pub fn write_byte(&mut self, address: u16, value: u8) {
         self.mmu.write8(address, value, &mut self.gpu, &mut self.timer);
+        if self.gpu.take_lyc_irq_pending() {
+            self.mmu.set_if_bits(0x02);
+        }
     }
 
-    pub fn tick(&mut self, cycles: u32) {
-        // 1) TIMA/DIV: keep your existing timer first
-        let overflow = self.timer.tick(cycles);
-        if overflow {
-            // IF register (0xFF0F): set bit-2 (Timer)
-            self.mmu.set_if_bits(0b0000_0100);
+    pub fn tick(&mut self, cpu_cycles: u32) {
+        let _overflow = self.timer.tick(cpu_cycles);
+        let ev = self.gpu.tick(cpu_cycles); // T-cycles == dots on DMG, no multiply
+        if !ev.if_set.is_empty() {
+            self.mmu.set_if_bits(ev.if_set.bits());
         }
-
-        // 2) PPU/LY scheduler (coarse):
-        //    - If `cycles` are M-cycles, convert to dots (T-cycles) by *4.
-        //    - If your CPU already returns dots, skip the *4.
-        let dots = cycles * 4; // adjust if needed
-        self.ppu_dots = self.ppu_dots.saturating_add(dots);
-
-        while self.ppu_dots >= 456 {
-            self.ppu_dots -= 456;
-
-            // next scanline
-            self.ly = self.ly.wrapping_add(1);
-
-            // Enter VBlank → set IF.VBLANK (bit 0) at LY == 144
-            if self.ly == 144 {
-                self.mmu.set_if_bits(0b0000_0001);
-            }
-
-            // Wrap after line 153 → back to LY=0
-            if self.ly > 153 {
-                self.ly = 0;
-            }
-        }
-
-        // 3) Mirror LY into FF44 so CPU reads see it changing in real time
-        //    (This is fine for a first pass; we can refine I/O semantics later.)
-        self.mmu.write8(0xff44, self.ly, &mut self.gpu, &mut self.timer);
-
-        // 4) (Optional later) STAT mode timing, LYC compare, STAT interrupts, etc.
     }
 }

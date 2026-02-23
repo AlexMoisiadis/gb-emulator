@@ -64,6 +64,14 @@ pub enum Instruction {
     OrA(LoadByteSource),
     CpA(LoadByteSource),
 
+    DAA,
+    CPL,
+    SCF,
+    CCF,
+
+    AddSpR8,
+    LdHlSpR8,
+
     EI, // 0xFB
     DI, // 0xF3
     RETI, // 0xD9
@@ -91,6 +99,7 @@ pub enum Instruction {
     // Misc
     NOP, // 0x00
     HALT, // 0x76
+    AddHL(Reg16),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -268,6 +277,60 @@ impl Instruction {
     fn from_byte_not_prefixed(byte: u8) -> Result<Instruction, DecodeError> {
         // --- Single-byte explicit instructions ---
         match byte {
+            0x27 => {
+                return Ok(Instruction::DAA);
+            }
+            0x2f => {
+                return Ok(Instruction::CPL);
+            }
+            0x37 => {
+                return Ok(Instruction::SCF);
+            }
+            0x3f => {
+                return Ok(Instruction::CCF);
+            }
+            0xc5 => {
+                return Ok(Instruction::PUSH(StackTarget::BC));
+            }
+            0xd5 => {
+                return Ok(Instruction::PUSH(StackTarget::DE));
+            }
+            0xe5 => {
+                return Ok(Instruction::PUSH(StackTarget::HL));
+            }
+            0xf5 => {
+                return Ok(Instruction::PUSH(StackTarget::AF));
+            }
+            0xc1 => {
+                return Ok(Instruction::POP(StackTarget::BC));
+            }
+            0xd1 => {
+                return Ok(Instruction::POP(StackTarget::DE));
+            }
+            0xe1 => {
+                return Ok(Instruction::POP(StackTarget::HL));
+            }
+            0xf1 => {
+                return Ok(Instruction::POP(StackTarget::AF));
+            }
+            0xe8 => {
+                return Ok(Instruction::AddSpR8);
+            }
+            0xf8 => {
+                return Ok(Instruction::LdHlSpR8);
+            }
+            0x09 => {
+                return Ok(Instruction::AddHL(Reg16::BC));
+            }
+            0x19 => {
+                return Ok(Instruction::AddHL(Reg16::DE));
+            }
+            0x29 => {
+                return Ok(Instruction::AddHL(Reg16::HL));
+            }
+            0x39 => {
+                return Ok(Instruction::AddHL(Reg16::SP));
+            }
             0x00 => {
                 return Ok(Instruction::NOP);
             }

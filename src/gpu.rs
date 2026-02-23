@@ -1,5 +1,6 @@
 // src/gpu.rs
 use std::array::from_fn;
+// use crate::bus::MemoryBus;
 
 /// Game Boy VRAM window for tile/tilemap data.
 /// (DMG/CGB share this base window; banking is not modeled here.)
@@ -22,6 +23,38 @@ pub const LCD_WIDTH: usize = 160;
 pub const LCD_HEIGHT: usize = 144;
 
 type Tile = [[TilePixelValue; 8]; 8];
+
+bitflags::bitflags! {
+    pub struct IfBits: u8 {
+        const VBLANK   = 0b0000_0001;
+        const LCD_STAT = 0b0000_0010;
+        // (Timer/Serial/Joypad if you want them later)
+    }
+}
+
+pub struct GpuEvents {
+    pub if_set: IfBits, // which IF bits to OR into 0xFF0F
+    pub frame_became_ready: bool,
+}
+
+enum PpuMode {
+    HBlank0,
+    VBlank1,
+    Oam2,
+    Xfer3,
+}
+
+impl PpuMode {
+    #[inline]
+    fn stat_bits(&self) -> u8 {
+        match *self {
+            PpuMode::HBlank0 => 0,
+            PpuMode::VBlank1 => 1,
+            PpuMode::Oam2 => 2,
+            PpuMode::Xfer3 => 3,
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct DebugOverlayConfig {
@@ -59,6 +92,15 @@ impl Default for DebugOverlayConfig {
     }
 }
 
+impl DebugOverlayConfig {
+    pub fn any_enabled(&self) -> bool {
+        self.show_bg_tile_grid ||
+            self.show_window_bounds ||
+            self.show_bg_axes ||
+            self.show_sprite_boxes
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TilePixelValue {
     Zero,
@@ -92,6 +134,7 @@ pub struct GPU {
     // --- OBJ palettes (DMG) ---
     obp0: u8, // FF48
     obp1: u8, // FF49
+    stat: u8, // mirror ff1
 
     // --- Scratch: BG raw color indices for current scanline (0..3) ---
     bg_idx_line: [u8; LCD_WIDTH],
@@ -100,6 +143,13 @@ pub struct GPU {
     window_line_counter: u8,
     // --- Debug overlay configuration (all off by default) ---
     debug: DebugOverlayConfig,
+    mode: PpuMode,
+    dot_in_mode: u16,
+    ly: u8,
+    frame_ready: bool,
+    framebuf: [[u8; LCD_WIDTH]; LCD_HEIGHT],
+    lyc: u8, // mirror ff45
+    lyc_irq_pending: bool,
 }
 
 impl GPU {
@@ -121,6 +171,14 @@ impl GPU {
             bg_idx_line: [0; LCD_WIDTH],
             window_line_counter: 0,
             debug: DebugOverlayConfig::default(),
+            mode: PpuMode::Oam2,
+            dot_in_mode: 0,
+            ly: 0,
+            frame_ready: false,
+            framebuf: [[0; LCD_WIDTH]; LCD_HEIGHT],
+            stat: 0,
+            lyc: 0,
+            lyc_irq_pending: false,
         }
     }
 
@@ -128,6 +186,60 @@ impl GPU {
     /// Resets the window internal line counter per Pan Docs.
     pub fn begin_frame(&mut self) {
         self.window_line_counter = 0;
+    }
+
+    pub fn write_lyc(&mut self, v: u8) {
+        self.lyc = v;
+        let equal = self.ly == self.lyc;
+        if equal {
+            self.stat |= 1 << 2;
+            if (self.stat & (1 << 6)) != 0 {
+                self.lyc_irq_pending = true;
+            }
+        } else {
+            self.stat &= !(1 << 2);
+        }
+    }
+
+    pub fn take_lyc_irq_pending(&mut self) -> bool {
+        let p = self.lyc_irq_pending;
+        self.lyc_irq_pending = false;
+        p
+    }
+
+    #[inline]
+    pub fn ly(&self) -> u8 {
+        self.ly
+    }
+    #[inline]
+    pub fn write_stat(&mut self, v: u8) {
+        // Bits 0-2 are read-only; only accept bits 3-6 from CPU writes
+        self.stat = (self.stat & 0x07) | (v & 0x78);
+    }
+    #[inline]
+    pub fn read_stat(&self) -> u8 {
+        let coinc = if self.ly == self.lyc { 1 << 2 } else { 0 };
+        (self.stat & !(1 << 2)) | coinc | 0x80
+    }
+
+    #[inline]
+    pub fn read_lyc(&self) -> u8 {
+        self.lyc
+    }
+
+    #[inline]
+    pub fn frame_is_ready(&self) -> bool {
+        self.frame_ready
+    }
+    #[inline]
+    pub fn take_frame_ready(&mut self) -> bool {
+        let r = self.frame_ready;
+        self.frame_ready = false;
+        r
+    }
+    #[inline]
+    pub fn copy_frame(&self, out: &mut [[u8; LCD_WIDTH]; LCD_HEIGHT]) {
+        *out = self.framebuf;
     }
 
     // ---------------------------
@@ -217,6 +329,110 @@ impl GPU {
         self.bgp
     }
 
+    /// Advance the PPU by `dots` (PPU "T-cycles"/dots). If your CPU returns M-cycles, multiply by 4 before calling.
+    pub fn tick(&mut self, mut dots: u32) -> GpuEvents {
+        let mut events = GpuEvents { if_set: IfBits::empty(), frame_became_ready: false };
+
+        while dots > 0 {
+            // --- per-mode remaining length ---
+            let mode_len: u16 = match self.mode {
+                PpuMode::Oam2 => 80,
+                PpuMode::Xfer3 => 172, // simple scanline renderer is OK for acid2
+                PpuMode::HBlank0 => 456 - 80 - 172,
+                PpuMode::VBlank1 => 456,
+            };
+
+            let rem = mode_len - self.dot_in_mode;
+            let step = rem.min(dots as u16);
+            self.dot_in_mode += step;
+            dots -= step as u32;
+
+            if self.dot_in_mode == mode_len {
+                self.dot_in_mode = 0;
+
+                match self.mode {
+                    PpuMode::Oam2 => {
+                        self.set_stat_mode(PpuMode::Xfer3, &mut events);
+                        self.mode = PpuMode::Xfer3;
+                    }
+                    PpuMode::Xfer3 => {
+                        if self.ly < (LCD_HEIGHT as u8) {
+                            let mut line = [0u8; LCD_WIDTH];
+                            self.render_scanline(self.ly, &mut line);
+                            self.render_scanline_objs(self.ly, &mut line);
+                            self.overlay_debug_scanline(self.ly, &mut line);
+                            self.framebuf[self.ly as usize].copy_from_slice(&line);
+                        }
+                        self.set_stat_mode(PpuMode::HBlank0, &mut events);
+                        self.mode = PpuMode::HBlank0;
+                    }
+                    PpuMode::HBlank0 => {
+                        self.ly = self.ly.wrapping_add(1);
+                        if self.ly == 144 {
+                            self.frame_ready = true;
+                            events.frame_became_ready = true;
+                            events.if_set |= IfBits::VBLANK;
+                            self.set_stat_mode(PpuMode::VBlank1, &mut events);
+                            self.mode = PpuMode::VBlank1;
+                        } else {
+                            self.set_stat_mode(PpuMode::Oam2, &mut events);
+                            self.mode = PpuMode::Oam2;
+                        }
+                        self.update_ly_and_lyc(&mut events); // ✅ after mode transition
+                    }
+                    PpuMode::VBlank1 => {
+                        self.ly = self.ly.wrapping_add(1);
+                        self.update_ly_and_lyc(&mut events);
+                        if self.ly == 154 {
+                            self.ly = 0;
+                            self.begin_frame();
+                            self.set_stat_mode(PpuMode::Oam2, &mut events);
+                            self.mode = PpuMode::Oam2;
+                            self.update_ly_and_lyc(&mut events);
+                        }
+                    }
+                }
+            }
+        }
+
+        events
+    }
+
+    // --- STAT/LY helpers (reuse your existing semantics) -----------------
+
+    #[inline]
+    fn set_stat_mode(&mut self, mode: PpuMode, events: &mut GpuEvents) {
+        // write STAT mode bits
+        self.stat = (self.stat & !0x03) | mode.stat_bits();
+
+        // If entering 0/1/2 and corresponding STAT enable bit is set, request LCD_STAT
+        // (STAT bits: 3:HBlank int enable, 4:VBlank int enable, 5:OAM int enable, 6:LYC)
+        let enabled = match mode {
+            PpuMode::HBlank0 => (self.stat & (1 << 3)) != 0,
+            PpuMode::VBlank1 => (self.stat & (1 << 4)) != 0,
+            PpuMode::Oam2 => (self.stat & (1 << 5)) != 0,
+            PpuMode::Xfer3 => false,
+        };
+        if enabled {
+            events.if_set |= IfBits::LCD_STAT;
+        }
+    }
+
+    #[inline]
+    fn update_ly_and_lyc(&mut self, events: &mut GpuEvents) {
+        // LYC coincidence (STAT bit 2 reflects equality; bit 6 is enable)
+        let equal = self.ly == self.lyc;
+        if equal {
+            self.stat |= 1 << 2;
+        } else {
+            self.stat &= !(1 << 2);
+        }
+        if equal && (self.stat & (1 << 6)) != 0 {
+            events.if_set |= IfBits::LCD_STAT;
+        }
+        // (Your MMU should read FF44 from GPU.ly, and FF41 from GPU.stat.)
+    }
+
     // ---------------------------
     // Addressing helpers
     // ---------------------------
@@ -258,33 +474,25 @@ impl GPU {
     /// decodes that tile row into the tile cache.
     pub fn write_vram(&mut self, index: usize, value: u8) {
         if index >= VRAM_SIZE {
-            return; // ignore OOB writes
+            return;
         }
-
         self.vram[index] = value;
 
-        // Only the tile pattern area updates the tile cache.
+        // Only update tile data region
         if index >= TILE_DATA_LEN {
             return;
         }
 
-        // Each tile is 16 bytes: 8 rows, 2 bytes per row (low and high planes).
-        // Normalize to an even index so we always read the low/high pair.
-        let norm = index & !1; // clear bit 0 => even
+        let norm = index & !1; // always start at even byte
         let b0 = self.vram[norm];
         let b1 = self.vram[norm + 1];
 
         let tile_index = norm / 16;
         let row_index = (norm % 16) / 2;
 
-        if tile_index >= self.tile_set.len() {
-            // Defensive: should not happen if TILE_DATA_LEN and TILE_COUNT are consistent.
-            return;
+        if tile_index < self.tile_set.len() {
+            self.tile_set[tile_index][row_index] = Self::decode_tile_row(b0, b1);
         }
-
-        // Decode the 2-bit plane row into 8 pixels.
-        let row = Self::decode_tile_row(b0, b1);
-        self.tile_set[tile_index][row_index] = row;
     }
 
     // ---------------------------
@@ -381,6 +589,7 @@ impl GPU {
             let tile_id = self.vram[map_base + map_off]; // assumes valid map_base + 0..1023
 
             // Resolve tile index into the tile_set based on LCDC bit4
+
             let tile_index: usize = if use_8000 {
                 // Unsigned index, 0..255 -> tiles 0..255
                 tile_id as usize
@@ -389,6 +598,8 @@ impl GPU {
                 let n = tile_id as i8 as i16;
                 (256i16 + n) as usize // range 128..383
             };
+
+            debug_assert!(tile_index < TILE_COUNT);
 
             // Read pixel color from tile cache (defensive bounds)
             let px = if tile_index < TILE_COUNT {
@@ -563,15 +774,14 @@ impl GPU {
     #[inline]
     fn decode_tile_row(b0: u8, b1: u8) -> [TilePixelValue; 8] {
         let mut row = [TilePixelValue::Zero; 8];
-        // Bit 7 => pixel 0; Bit 0 => pixel 7 (left-to-right)
         for k in 0..8 {
             let bit = 7 - k;
             let lsb = (b0 >> bit) & 1;
             let msb = (b1 >> bit) & 1;
-            row[k] = match (lsb, msb) {
+            row[k] = match (msb, lsb) {
                 (0, 0) => TilePixelValue::Zero,
-                (1, 0) => TilePixelValue::One,
-                (0, 1) => TilePixelValue::Two,
+                (0, 1) => TilePixelValue::One,
+                (1, 0) => TilePixelValue::Two,
                 (1, 1) => TilePixelValue::Three,
                 _ => unreachable!(),
             };
@@ -606,10 +816,10 @@ impl GPU {
     // ---------------------------
     /// Replace the current debug overlay configuration.
     pub fn set_debug_config(&mut self, cfg: DebugOverlayConfig) {
-        // clamp shades to 0..3 to avoid invalid DMG shade indices
         fn clamp2(x: u8) -> u8 {
-            if x > 3 { 3 } else { x }
+            x.min(3)
         }
+
         self.debug = DebugOverlayConfig {
             show_bg_tile_grid: cfg.show_bg_tile_grid,
             show_window_bounds: cfg.show_window_bounds,
@@ -631,12 +841,23 @@ impl GPU {
     pub fn debug_config(&self) -> &DebugOverlayConfig {
         &self.debug
     }
+    #[inline]
+    fn blend(over: u8, base: u8) -> u8 {
+        if over > base { over } else { base }
+    }
+
+    #[inline]
+    fn put_pixel_safe(out: &mut [u8; LCD_WIDTH], x: i32, shade: u8) {
+        if (0..LCD_WIDTH as i32).contains(&x) {
+            out[x as usize] = Self::blend(shade, out[x as usize]);
+        }
+    }
 
     /// Apply optional debug overlays to the already rendered scanline in `out`.
     /// Call this after `render_scanline` and `render_scanline_objs` for line `ly`.
     /// Overlays are drawn using simple blending that prefers darker shades (max of DMG shade indices).
     pub fn overlay_debug_scanline(&self, ly: u8, out: &mut [u8; LCD_WIDTH]) {
-        // early exit if nothing enabled
+        // Early exit if nothing enabled
         if
             !(
                 self.debug.show_bg_tile_grid ||
@@ -647,111 +868,77 @@ impl GPU {
         {
             return;
         }
-        #[inline]
-        fn blend(over: u8, base: u8) -> u8 {
-            if over > base { over } else { base }
-        }
 
-        // 1) BG tile grid (every 8 px in screen space), accounts for SCX/SCY wrapping per Pan Docs.
+        // 1) BG tile grid (every 8 px), accounts for SCX/SCY
         if self.debug.show_bg_tile_grid {
-            let scx = self.scx as usize;
-            let scy = self.scy as usize;
             let shade = self.debug.shade_grid & 0b11;
-            // vertical grid: columns where (SCX + x) % 8 == 0
-            for x in 0..LCD_WIDTH {
-                if ((scx + x) & 7) == 0 {
-                    out[x] = blend(shade, out[x]);
+            for x in 0..LCD_WIDTH as i32 {
+                if (((self.scx as i32) + x) & 7) == 0 {
+                    Self::put_pixel_safe(out, x, shade);
                 }
             }
-            // horizontal grid: this line if (SCY + LY) % 8 == 0
-            if ((scy + (ly as usize)) & 7) == 0 {
-                for x in 0..LCD_WIDTH {
-                    out[x] = blend(shade, out[x]);
+            // horizontal line
+            if (((self.scy as i32) + (ly as i32)) & 7) == 0 {
+                for x in 0..LCD_WIDTH as i32 {
+                    Self::put_pixel_safe(out, x, shade);
                 }
             }
         }
 
-        // 2) Window bounds (WX-7 quirk and WY per Pan Docs). Draw top and left borders when window is enabled and in-range.
+        // 2) Window bounds (top + left), WX-7 quirk
         if self.debug.show_window_bounds {
-            let win_on = (self.lcdc & 0x20) != 0; // LCDC.5
+            let win_on = (self.lcdc & 0x20) != 0;
             if win_on {
-                let win_left = self.wx.wrapping_sub(7); // WX-7 quirk
-                let wy = self.wy; // top of window
-                let shade = self.debug.shade_window & 0b11;
-                // Top border: when ly == WY, cover from max(0, win_left) to 159
-                if ly == wy {
-                    let start_x = if win_left >= 160 { 160 } else { win_left as usize };
-                    for x in start_x..LCD_WIDTH {
-                        out[x] = blend(shade, out[x]);
+                let win_left = self.wx.wrapping_sub(7) as i32;
+                let wy = self.wy as i32;
+                if (ly as i32) == wy {
+                    // top border
+                    for x in 0..LCD_WIDTH as i32 {
+                        Self::put_pixel_safe(out, x, self.debug.shade_window & 0b11);
                     }
                 }
-                // Left border: for ly >= WY, single pixel at x = win_left
-                if ly >= wy {
-                    if win_left < 160 {
-                        out[win_left as usize] = blend(shade, out[win_left as usize]);
-                    }
+                // left border
+                if (0..LCD_WIDTH as i32).contains(&win_left) {
+                    Self::put_pixel_safe(out, win_left, self.debug.shade_window & 0b11);
                 }
             }
         }
 
-        // 3) BG axes: X= -SCX (mod 256), Y= -SCY (mod 256), if they fall on-screen this frame/scanline
+        // 3) BG origin axes
         if self.debug.show_bg_axes {
             let shade = self.debug.shade_axes & 0b11;
-            // vertical axis x_v = (-SCX) mod 256; draw if 0..159
-            let x_v = ((256usize - (self.scx as usize)) & 255) as usize;
-            if x_v < LCD_WIDTH {
-                out[x_v] = blend(shade, out[x_v]);
+            if (0..LCD_WIDTH as i32).contains(&(0 - (self.scx as i32))) {
+                Self::put_pixel_safe(out, 0 - (self.scx as i32), shade);
             }
-            // horizontal axis y_h = (-SCY) mod 256; draw if equals ly and 0..143
-            let y_h = ((256usize - (self.scy as usize)) & 255) as u8;
-            if y_h == ly {
-                for x in 0..LCD_WIDTH {
-                    out[x] = blend(shade, out[x]);
+            if (self.scy as i32) + (ly as i32) == 0 {
+                for x in 0..LCD_WIDTH as i32 {
+                    Self::put_pixel_safe(out, x, shade);
                 }
             }
         }
 
-        // 4) Sprite (OBJ) boxes: outline 8-wide (or 16-high) rectangles for any OAM entry intersecting this scanline
+        // 4) Sprite boxes (draw 8x8/8x16 rectangles for all 40 sprites)
         if self.debug.show_sprite_boxes {
-            let obj_8x16 = (self.lcdc & 0x04) != 0; // LCDC.2
-            let obj_h: i16 = if obj_8x16 { 16 } else { 8 };
             let shade = self.debug.shade_sprite_box & 0b11;
-            let ly_i16 = ly as i16;
             for i in 0..40 {
                 let base = i * 4;
-                let oam_y = self.oam[base] as i16;
-                let oam_x = self.oam[base + 1] as i16;
-                let y = oam_y - 16; // on-screen Y per Pan Docs
-                let x = oam_x - 8; // on-screen X per Pan Docs
-                // intersect this scanline?
-                if ly_i16 < y || ly_i16 >= y + obj_h {
-                    continue;
-                }
-                let left = x;
-                let right = x + 7;
-                // vertical borders at left and right
-                if left >= 0 && left < (LCD_WIDTH as i16) {
-                    let sx = left as usize;
-                    out[sx] = blend(shade, out[sx]);
-                }
-                if right >= 0 && right < (LCD_WIDTH as i16) {
-                    let sx = right as usize;
-                    out[sx] = blend(shade, out[sx]);
-                }
-                // top border when this is the first visible line of the OBJ on-screen
-                if ly_i16 == y {
-                    let start = left.max(0) as usize;
-                    let end = right.min((LCD_WIDTH as i16) - 1) as usize;
-                    for sx in start..=end {
-                        out[sx] = blend(shade, out[sx]);
+                let sprite_y = (self.oam[base] as i32) - 16;
+                let sprite_x = (self.oam[base + 1] as i32) - 8;
+                let obj_8x16 = (self.lcdc & 0x04) != 0;
+                let h = if obj_8x16 { 16 } else { 8 };
+                let line = ly as i32;
+                if line >= sprite_y && line < sprite_y + h {
+                    // draw horizontal line of box
+                    for px in 0..8 {
+                        Self::put_pixel_safe(out, sprite_x + px, shade);
                     }
-                }
-                // bottom border when last line
-                if ly_i16 == y + obj_h - 1 {
-                    let start = left.max(0) as usize;
-                    let end = right.min((LCD_WIDTH as i16) - 1) as usize;
-                    for sx in start..=end {
-                        out[sx] = blend(shade, out[sx]);
+                    // draw vertical edges
+                    Self::put_pixel_safe(out, sprite_x, shade);
+                    Self::put_pixel_safe(out, sprite_x + 7, shade);
+                    if obj_8x16 {
+                        // draw extra vertical for 16px sprite
+                        Self::put_pixel_safe(out, sprite_x + 0, shade);
+                        Self::put_pixel_safe(out, sprite_x + 7, shade);
                     }
                 }
             }

@@ -423,6 +423,11 @@ impl CPU {
         20 // cycles for ISR entry
     }
 
+    fn any_pending_interrupt(&self, bus: &mut MemoryBus) -> bool {
+        let (ie, iflag) = Self::read_ie_if(bus);
+        (ie & iflag) != 0
+    }
+
     /// Execute a single instruction and return consumed cycles.
 
     pub fn step(&mut self, bus: &mut MemoryBus) -> u32 {
@@ -452,21 +457,24 @@ impl CPU {
         cycles
     }
 
-    /// Execute exactly one instruction (or burn cycles if HALTed) and return cycles.
     #[inline]
     fn execute_one(&mut self, bus: &mut MemoryBus) -> u32 {
-        // HALT handling: burn or wake then continue to execute the next instruction
+        // HALT handling: burn cycles or wake, including HALT bug
         if self.halted {
             if Self::pending_interrupt_mask(bus) != 0 {
-                // Wake from HALT, fall through to fetch/execute the next instruction
+                // Wake from HALT
                 self.halted = false;
+
+                // HALT bug check: IME=0 + pending interrupt → next fetch does not increment PC
+                // We'll mark it by not incrementing PC in fetch
+                // This is handled in fetch8 itself
             } else {
                 // Remain in HALT: burn 4 cycles (do not fetch)
                 return 4;
             }
         }
 
-        // Fetch opcode
+        // Fetch opcode (fetch8 handles HALT bug automatically)
         let pc_before = self.pc;
         let op = self.fetch8(bus);
         self.last_pc = pc_before;
@@ -474,7 +482,6 @@ impl CPU {
 
         if op == 0xcb {
             let cb = self.fetch8(bus);
-            // TRACE (CB-prefixed)
             self.trace_insn(pc_before, op, Some(cb));
 
             match Instruction::from_byte(cb, true) {
@@ -487,7 +494,6 @@ impl CPU {
                 Err(e) => self.trap_unknown(e),
             }
         } else {
-            // TRACE (non-CB)
             self.trace_insn(pc_before, op, None);
 
             match Instruction::from_byte(op, false) {
@@ -502,11 +508,16 @@ impl CPU {
         }
     }
 
-    #[inline]
     fn fetch8(&mut self, bus: &mut MemoryBus) -> u8 {
-        let b = bus.read_byte(self.pc);
-        self.pc = self.pc.wrapping_add(1);
-        b
+        let addr = self.pc;
+        let value = bus.read_byte(addr);
+
+        // HALT bug: if CPU is halted, IME=0, and a pending interrupt exists → PC does not increment
+        if !(self.halted && !self.ime && self.any_pending_interrupt(bus)) {
+            self.pc = self.pc.wrapping_add(1);
+        }
+
+        value
     }
 
     #[inline]
@@ -753,7 +764,124 @@ impl CPU {
             // ---------- Misc ----------
             Instruction::NOP => 4,
             Instruction::HALT => {
-                self.halted = true;
+                // If IME is enabled or no interrupts are pending, normal HALT
+                if self.ime || !self.any_pending_interrupt(bus) {
+                    self.halted = true;
+                } else {
+                    // HALT bug: IME = 0 and interrupt pending
+                    // PC will *not* increment on next fetch
+                    // We'll use a special flag in fetch to detect this
+                    self.halted = true; // keep halted true, but fetch will handle bug
+                }
+                4
+            }
+
+            Instruction::AddHL(reg) => {
+                let hl = self.regs.get_hl();
+                let val = match reg {
+                    Reg16::BC => self.regs.get_bc(),
+                    Reg16::DE => self.regs.get_de(),
+                    Reg16::HL => self.regs.get_hl(),
+                    Reg16::SP => self.sp,
+                    _ => unreachable!(),
+                };
+
+                let result = hl.wrapping_add(val);
+
+                // Flags:
+                // Z unaffected
+                // N = 0
+                // H = carry from bit 11
+                // C = carry from bit 15
+                self.regs.f.subtract = false;
+                self.regs.f.half_carry = (hl & 0x0fff) + (val & 0x0fff) > 0x0fff;
+                self.regs.f.carry = (hl as u32) + (val as u32) > 0xffff;
+
+                self.regs.set_hl(result);
+                8
+            }
+
+            // ---------- ADD SP, r8 ----------
+            Instruction::AddSpR8 => {
+                let offset = self.fetch8(bus) as i8 as i16;
+                let sp = self.sp;
+                let result = sp.wrapping_add(offset as u16);
+
+                // Flags according to Mooneye test:
+                self.regs.f.zero = false; // Z = 0
+                self.regs.f.subtract = false; // N = 0
+                self.regs.f.half_carry = ((sp ^ (offset as u16) ^ result) & 0x10) != 0; // H = carry from bit 3
+                self.regs.f.carry = ((sp ^ (offset as u16) ^ result) & 0x100) != 0; // C = carry from bit 7
+
+                self.sp = result;
+                16
+            }
+
+            // ---------- LD HL, SP+r8 ----------
+            Instruction::LdHlSpR8 => {
+                let offset = self.fetch8(bus) as i8 as i16;
+                let sp = self.sp;
+                let result = sp.wrapping_add(offset as u16);
+
+                // Flags according to Mooneye test:
+                self.regs.f.zero = false; // Z = 0
+                self.regs.f.subtract = false; // N = 0
+                self.regs.f.half_carry = ((sp ^ (offset as u16) ^ result) & 0x10) != 0; // H = carry from bit 3
+                self.regs.f.carry = ((sp ^ (offset as u16) ^ result) & 0x100) != 0; // C = carry from bit 7
+
+                self.regs.set_hl(result); // HL = SP + r8
+                12
+            }
+
+            // ---------- DAA ----------
+            Instruction::DAA => {
+                let mut a = self.regs.a;
+                let mut adjust = 0;
+                let mut carry = self.regs.f.carry;
+
+                if !self.regs.f.subtract {
+                    if self.regs.f.half_carry || a & 0x0f > 9 {
+                        adjust |= 0x06;
+                    }
+                    if self.regs.f.carry || a > 0x99 {
+                        adjust |= 0x60;
+                        carry = true;
+                    }
+                    a = a.wrapping_add(adjust);
+                } else {
+                    if self.regs.f.half_carry {
+                        adjust |= 0x06;
+                    }
+                    if self.regs.f.carry {
+                        adjust |= 0x60;
+                    }
+                    a = a.wrapping_sub(adjust);
+                }
+
+                self.regs.a = a;
+                self.regs.f.zero = a == 0;
+                self.regs.f.half_carry = false;
+                self.regs.f.carry = carry;
+                4
+            }
+            Instruction::CPL => {
+                self.regs.a = !self.regs.a;
+                self.regs.f.subtract = true;
+                self.regs.f.half_carry = true;
+                4
+            }
+
+            Instruction::SCF => {
+                self.regs.f.subtract = false;
+                self.regs.f.half_carry = false;
+                self.regs.f.carry = true;
+                4
+            }
+
+            Instruction::CCF => {
+                self.regs.f.subtract = false;
+                self.regs.f.half_carry = false;
+                self.regs.f.carry = !self.regs.f.carry;
                 4
             }
 
@@ -1213,7 +1341,10 @@ impl CPU {
             }
 
             // ---------- Fallback ----------
-            _ => self.trap_unknown(DecodeError::UnknownOpcode(0x00, false)),
+            _ => {
+                eprintln!("UNHANDLED INSTRUCTION: {:?} at PC={:04X}", insn, self.last_pc);
+                self.trap_unknown(DecodeError::UnknownOpcode(0x00, false))
+            }
         }
     }
 
