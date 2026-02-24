@@ -56,6 +56,14 @@ pub struct CPU {
     trace: bool,
     last_pc: u16,
     last_op: u8,
+
+    // --- NEW: low-noise debug snapshots (only used when debug_timing is on) ---
+    #[cfg(feature = "debug_timing")]
+    last_ime: bool,
+    #[cfg(feature = "debug_timing")]
+    last_ie: u8,
+    #[cfg(feature = "debug_timing")]
+    last_if: u8,
 }
 
 impl CPU {
@@ -76,6 +84,14 @@ impl CPU {
             trace: false,
             last_pc: 0,
             last_op: 0,
+
+            // --- NEW ---
+            #[cfg(feature = "debug_timing")]
+            last_ime: false,
+            #[cfg(feature = "debug_timing")]
+            last_ie: 0,
+            #[cfg(feature = "debug_timing")]
+            last_if: 0,
         }
     }
 
@@ -381,10 +397,10 @@ impl CPU {
         (ie, iflag)
     }
 
-    #[inline]
-    fn write_if(bus: &mut MemoryBus, val: u8) {
-        bus.write_byte(0xff0f, val);
-    }
+    // #[inline]
+    // fn write_if(bus: &mut MemoryBus, val: u8) {
+    //     bus.write_byte(0xff0f, val);
+    // }
 
     #[inline]
     fn pending_interrupt_mask(bus: &mut MemoryBus) -> u8 {
@@ -392,36 +408,36 @@ impl CPU {
         ie & iflag
     }
 
-    fn service_interrupt(&mut self, bus: &mut MemoryBus) -> u32 {
-        // Priority: bit0..bit4 => vectors 0x40,0x48,0x50,0x58,0x60
-        let (ie, iflag) = Self::read_ie_if(bus);
-        let pending = ie & iflag;
-        if pending == 0 {
-            return 0;
-        }
+    // fn service_interrupt(&mut self, bus: &mut MemoryBus) -> u32 {
+    //     // Priority: bit0..bit4 => vectors 0x40,0x48,0x50,0x58,0x60
+    //     let (ie, iflag) = Self::read_ie_if(bus);
+    //     let pending = ie & iflag;
+    //     if pending == 0 {
+    //         return 0;
+    //     }
 
-        let (bit, vector) = if (pending & 0x01) != 0 {
-            (0, 0x0040)
-        } else if (pending & 0x02) != 0 {
-            (1, 0x0048)
-        } else if (pending & 0x04) != 0 {
-            (2, 0x0050)
-        } else if (pending & 0x08) != 0 {
-            (3, 0x0058)
-        } else {
-            (4, 0x0060)
-        };
+    //     let (bit, vector) = if (pending & 0x01) != 0 {
+    //         (0, 0x0040)
+    //     } else if (pending & 0x02) != 0 {
+    //         (1, 0x0048)
+    //     } else if (pending & 0x04) != 0 {
+    //         (2, 0x0050)
+    //     } else if (pending & 0x08) != 0 {
+    //         (3, 0x0058)
+    //     } else {
+    //         (4, 0x0060)
+    //     };
 
-        // Clear IF bit
-        let new_if = iflag & !(1 << bit);
-        Self::write_if(bus, new_if);
+    //     // Clear IF bit
+    //     let new_if = iflag & !(1 << bit);
+    //     Self::write_if(bus, new_if);
 
-        // Enter ISR
-        self.ime = false;
-        self.push16(bus, self.pc);
-        self.pc = vector;
-        20 // cycles for ISR entry
-    }
+    //     // Enter ISR
+    //     self.ime = false;
+    //     self.push16(bus, self.pc);
+    //     self.pc = vector;
+    //     20 // cycles for ISR entry
+    // }
 
     fn any_pending_interrupt(&self, bus: &mut MemoryBus) -> bool {
         let (ie, iflag) = Self::read_ie_if(bus);
@@ -431,30 +447,122 @@ impl CPU {
     /// Execute a single instruction and return consumed cycles.
 
     pub fn step(&mut self, bus: &mut MemoryBus) -> u32 {
-        // Interrupt service (highest priority) when IME is set
-        let cycles = if self.ime {
-            let pending = Self::pending_interrupt_mask(bus);
-            if pending != 0 {
-                // Service interrupt; do NOT tick here—tick once at the end.
-                self.service_interrupt(bus)
-            } else {
-                self.execute_one(bus)
-            }
-        } else {
-            self.execute_one(bus)
-        };
-
-        // EI delayed enabling: IME becomes true after the next instruction completes
+        // --- EI delayed-IME semantics ----------------------------------------
+        // If EI was executed previously, IME must become 1 *after* the next
+        // instruction completes (i.e., between instructions, not immediately).
+        // We snapshot the condition at the start of this step and apply IME at
+        // the end of this step if we're on that "next" instruction.
+        let enable_ime_after_this_instruction = self.ei_delay == 1;
         if self.ei_delay > 0 {
             self.ei_delay = self.ei_delay.saturating_sub(1);
-            if self.ei_delay == 0 {
-                self.ime = true;
+        }
+
+        // 1) Execute one instruction and get the cycles it consumed
+        let tcycles: u32 = self.execute_one(bus);
+
+        // 2) Advance PPU by the same amount and surface its events into IF now
+        bus.service_gpu(tcycles);
+
+        // 3) Apply the deferred IME enable (EI delay completes *after* this instr)
+
+        if enable_ime_after_this_instruction {
+            self.ime = true;
+            #[cfg(feature = "debug_timing")]
+            eprintln!("[CPU] IME enabled (EI delay complete)");
+        }
+
+        #[cfg(feature = "debug_timing")]
+        {
+            // Read IE/IF once (these are the exact values that will gate ISR entry)
+            let ie_now = bus.read_byte(0xffff);
+            let if_now = bus.read_byte(0xff0f);
+            let ime_now = self.ime;
+            let pend = ie_now & if_now;
+
+            // Only print when one of the values changes (prevents console flood)
+            if ime_now != self.last_ime || ie_now != self.last_ie || if_now != self.last_if {
+                eprintln!(
+                    "[CPU] IME={} IE={:02X} IF={:02X} pending={:02X}",
+                    ime_now as u8,
+                    ie_now,
+                    if_now,
+                    pend
+                );
+                self.last_ime = ime_now;
+                self.last_ie = ie_now;
+                self.last_if = if_now;
             }
         }
 
-        // Tick SoC components exactly once with the consumed cycles
-        bus.tick(cycles);
-        cycles
+        // 4) Interrupt entry: if IME is set and any interrupt is pending, service it now.
+        if self.ime && self.any_pending_interrupt(bus) {
+            self.service_one_interrupt(bus);
+        } else if self.halted && self.any_pending_interrupt(bus) {
+            // Wake from HALT even if IME is 0 (matches DMG behavior)
+            self.halted = false;
+        }
+
+        tcycles
+    }
+
+    /// Service a single interrupt by priority (VBlank -> LCD STAT -> Timer -> Serial -> Joypad).
+    /// Clears IF bit, clears IME, pushes PC, and jumps to vector.
+    fn service_one_interrupt(&mut self, bus: &mut MemoryBus) {
+        const IE_ADDR: u16 = 0xffff;
+        const IF_ADDR: u16 = 0xff0f;
+
+        let ie = bus.read_byte(IE_ADDR);
+        let mut iflag = bus.read_byte(IF_ADDR);
+        let pending = ie & iflag;
+        if pending == 0 {
+            return;
+        }
+
+        // Interrupt table (bit, vector)
+        //  VBlank: bit0 -> 0x0040
+        //  LCDSTAT: bit1 -> 0x0048
+        //  Timer: bit2 -> 0x0050
+        //  Serial: bit3 -> 0x0058
+        //  Joypad: bit4 -> 0x0060
+        const VBLANK: (u8, u16) = (0, 0x0040);
+        const LCDSTAT: (u8, u16) = (1, 0x0048);
+        const TIMER: (u8, u16) = (2, 0x0050);
+        const SERIAL: (u8, u16) = (3, 0x0058);
+        const JOYPAD: (u8, u16) = (4, 0x0060);
+
+        // Choose highest priority set bit
+        let (bit, vector) = if (pending & (1 << VBLANK.0)) != 0 {
+            VBLANK
+        } else if (pending & (1 << LCDSTAT.0)) != 0 {
+            LCDSTAT
+        } else if (pending & (1 << TIMER.0)) != 0 {
+            TIMER
+        } else if (pending & (1 << SERIAL.0)) != 0 {
+            SERIAL
+        } else {
+            JOYPAD
+        };
+
+        // Clear the IF bit we are servicing
+        iflag &= !(1 << bit);
+        bus.write_byte(IF_ADDR, iflag);
+
+        // Disable IME
+        self.ime = false;
+
+        // Push PC to stack (little endian)
+        let hi = ((self.pc >> 8) & 0xff) as u8;
+        let lo = (self.pc & 0xff) as u8;
+        self.sp = self.sp.wrapping_sub(1);
+        bus.write_byte(self.sp, hi);
+        self.sp = self.sp.wrapping_sub(1);
+        bus.write_byte(self.sp, lo);
+
+        // Jump to vector
+        self.pc = vector;
+
+        #[cfg(feature = "debug_timing")]
+        eprintln!("[CPU] ISR vector={:#06X} (bit {}) IME=OFF", vector, bit);
     }
 
     #[inline]
@@ -773,6 +881,67 @@ impl CPU {
                     // We'll use a special flag in fetch to detect this
                     self.halted = true; // keep halted true, but fetch will handle bug
                 }
+                4
+            }
+
+            Instruction::STOP => {
+                self.pc = self.pc.wrapping_add(1);
+                4
+            }
+
+            Instruction::RLCA => {
+                let old_bit7 = (self.regs.a & 0x80) != 0;
+                self.regs.a = (self.regs.a << 1) | (if old_bit7 { 1 } else { 0 });
+
+                // Flags
+                self.regs.f.zero = false; // Z always cleared
+                self.regs.f.subtract = false; // N cleared
+                self.regs.f.half_carry = false; // H cleared
+                self.regs.f.carry = old_bit7; // C = old bit 7
+
+                4 // cycles
+            }
+
+            Instruction::RLA => {
+                let old_carry = if self.regs.f.carry { 1 } else { 0 };
+                let new_carry = (self.regs.a & 0x80) != 0;
+
+                self.regs.a = (self.regs.a << 1) | old_carry;
+
+                // Flags
+                self.regs.f.zero = false; // Z cleared
+                self.regs.f.subtract = false; // N cleared
+                self.regs.f.half_carry = false; // H cleared
+                self.regs.f.carry = new_carry; // C = old bit 7
+
+                4
+            }
+
+            Instruction::RRCA => {
+                let old_bit0 = (self.regs.a & 0x01) != 0;
+                self.regs.a = (self.regs.a >> 1) | (if old_bit0 { 0x80 } else { 0 });
+
+                // Flags
+                self.regs.f.zero = false; // Z cleared
+                self.regs.f.subtract = false; // N cleared
+                self.regs.f.half_carry = false; // H cleared
+                self.regs.f.carry = old_bit0; // C = old bit 0
+
+                4
+            }
+
+            Instruction::RRA => {
+                let old_carry = if self.regs.f.carry { 0x80 } else { 0 };
+                let new_carry = (self.regs.a & 0x01) != 0;
+
+                self.regs.a = (self.regs.a >> 1) | old_carry;
+
+                // Flags
+                self.regs.f.zero = false; // Z cleared
+                self.regs.f.subtract = false; // N cleared
+                self.regs.f.half_carry = false; // H cleared
+                self.regs.f.carry = new_carry; // C = old bit 0
+
                 4
             }
 
@@ -1288,8 +1457,8 @@ impl CPU {
             // --- EI / DI / RETI ---
             Instruction::EI => {
                 // Schedule IME enabling after the *next* instruction completes.
-                // (Two ticks because we decrement once right after EI, then once after the next instruction.)
-                self.ei_delay = 2;
+                // (One tick because we decrement once right after EI, then once after the next instruction.)
+                self.ei_delay = 1;
                 4
             }
             Instruction::DI => {

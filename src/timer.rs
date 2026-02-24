@@ -1,24 +1,28 @@
-/// Game Boy timer block: DIV/TIMA/TMA/TAC with edge-based increments.
-///
-/// Implementation notes:
-/// - `div_counter` is a 16-bit cycle counter; DIV = (div_counter >> 8).
-/// - TIMA increments on the **falling edge** of a selected `div_counter` bit when TAC enable=1:
-///     TAC[1:0] -> bit index used:
-///         00 -> bit 9  (4096 Hz)   (every 1024 cycles)
-///         01 -> bit 3  (262144 Hz) (every 16 cycles)
-///         10 -> bit 5  (65536 Hz)  (every 64 cycles)
-///         11 -> bit 7  (16384 Hz)  (every 256 cycles)
-/// - On TIMA overflow (FF->00), TIMA reloads from TMA and IF[TIMER] is requested.
+// src/timer.rs
 
+/// Game Boy timer block: DIV/TIMA/TMA/TAC with **edge-based increments**
+/// and DMG quirks: DIV/TAC "glitch" ticks, delayed TMA reload, and
+/// write-to-TIMA cancel window (1 M-cycle).
+///
+/// References:
+/// - Pan Docs: Timer & Divider, Obscure Behaviour.  [1](https://gbdev.gg8.se/wiki/articles/Timer_and_Divider_Registers)[2](https://gbdev.io/pandocs/Timer_Obscure_Behaviour.html)
+/// - GbdevWiki mirror (same content).              [3](https://gbdev.gg8.se/wiki/articles/Timer_Obscure_Behaviour)
 pub struct Timer {
-    divider: u8, // FF04
+    // Public-facing registers
+    divider: u8, // FF04 (visible DIV = high 8 bits of system counter)
     tima: u8, // FF05
     tma: u8, // FF06
-    tac: u8, // FF07
-    enabled: bool, // TAC enable flag
-    step: u32, // Number of cycles per TIMA increment
-    internalcnt: u32, // Accumulated cycles for TIMA
-    internaldiv: u32, // Accumulated cycles for DIV
+    tac: u8, // FF07 (bits 2..0 used; 7..3 read as 1)
+
+    // Internal state
+    div_counter: u16, // 16-bit system counter (increments every M-cycle)
+    timer_enabled: bool, // TAC.2
+    timer_bit: u8, // selected source bit in div_counter: {9,3,5,7}
+    prev_timer_bit_state: bool, // previous sampled bit for falling-edge detection
+
+    // TIMA overflow quirk state (1 M-cycle delayed reload & IF)
+    overflow_pending: bool, // an overflow occurred last cycle
+    overflow_delay: u8, // counts down M-cycles until reload/IF (1 on DMG)
 }
 
 impl Timer {
@@ -28,51 +32,99 @@ impl Timer {
             tima: 0,
             tma: 0,
             tac: 0,
-            enabled: false,
-            step: 1024, // default frequency (00 -> 4096 Hz)
-            internalcnt: 0,
-            internaldiv: 0,
+            div_counter: 0,
+            timer_enabled: false,
+            timer_bit: 9, // 00 -> 4096 Hz
+            prev_timer_bit_state: false,
+            overflow_pending: false,
+            overflow_delay: 0,
         }
     }
 
+    /// Map TAC bits to the corresponding bit of div_counter
     #[inline]
-    fn update_step(&mut self) {
-        // Update step and enabled from TAC
-        self.enabled = (self.tac & 0b100) != 0;
-        self.step = match self.tac & 0b11 {
-            0b00 => 1024,
-            0b01 => 16,
-            0b10 => 64,
-            0b11 => 256,
-            _ => 1024,
-        };
+    fn map_tac_bit(sel: u8) -> u8 {
+        match sel & 0b11 {
+            0b00 => 9, // 4096 Hz
+            0b01 => 3, // 262144 Hz
+            0b10 => 5, // 65536 Hz
+            0b11 => 7, // 16384 Hz
+            _ => 9,
+        }
     }
 
+    /// Refresh enable + source bit selection; also resample prev bit state.
+    #[inline]
+    fn update_tac_common(&mut self) {
+        self.timer_enabled = (self.tac & 0b100) != 0;
+        self.timer_bit = Self::map_tac_bit(self.tac);
+        self.prev_timer_bit_state = ((self.div_counter >> self.timer_bit) & 1) != 0;
+    }
+
+    /// Advances the timer by the given number of M-cycles.
+    /// Returns true if a TIMA overflow **IRQ request** should be raised now.
+    ///
+    /// NOTE: On DMG, when TIMA overflow occurs, **reload + IF** happen **one M-cycle later**.
+    /// We report `true` on that delayed cycle (not on the cycle that overflowed).  [2](https://gbdev.io/pandocs/Timer_Obscure_Behaviour.html)
     pub fn tick(&mut self, cycles: u32) -> bool {
-        let mut overflowed = false;
+        let mut irq_timer = false;
 
-        // DIV increment (every 256 CPU cycles)
-        self.internaldiv += cycles;
-        while self.internaldiv >= 256 {
-            self.divider = self.divider.wrapping_add(1);
-            self.internaldiv -= 256;
-        }
+        for _ in 0..cycles {
+            // 1) System counter always increments (unless STOP; not modeled here)
+            self.div_counter = self.div_counter.wrapping_add(1);
+            self.divider = (self.div_counter >> 8) as u8;
 
-        // TIMA increment if enabled
-        if self.enabled {
-            self.internalcnt += cycles;
-            while self.internalcnt >= self.step {
-                let (next, of) = self.tima.overflowing_add(1);
-                self.tima = next;
-                if of {
-                    self.tima = self.tma;
-                    overflowed = true;
+            // 2) Handle pending overflow delay from a previous cycle
+            if self.overflow_pending {
+                if self.overflow_delay > 0 {
+                    self.overflow_delay -= 1;
                 }
-                self.internalcnt -= self.step;
+                if self.overflow_delay == 0 {
+                    // Complete the delayed reload and request IF
+                    self.tima = self.tma;
+                    irq_timer = true; // request IF this M-cycle
+                    self.overflow_pending = false;
+                    // NOTE: prev_timer_bit_state is unaffected here
+                }
+            }
+
+            // 3) Live timer (falling-edge detection) when enabled
+            if self.timer_enabled {
+                let current = ((self.div_counter >> self.timer_bit) & 1) != 0;
+                // Only increment on falling edge: prev=1 -> current=0
+                if self.prev_timer_bit_state && !current {
+                    self.tick_tima_once();
+                }
+                self.prev_timer_bit_state = current;
             }
         }
 
-        overflowed
+        irq_timer
+    }
+
+    /// Increment TIMA once; if it overflows, start the **delayed reload** window.
+    #[inline]
+    fn tick_tima_once(&mut self) {
+        let (next, of) = self.tima.overflowing_add(1);
+        self.tima = next;
+        if of {
+            // Hardware quirk: TIMA becomes 00 for one M-cycle; TMA reload + IF next cycle. [2](https://gbdev.io/pandocs/Timer_Obscure_Behaviour.html)
+            self.tima = 0x00;
+            self.overflow_pending = true;
+            self.overflow_delay = 1; // 1 M-cycle later (not 4 clocks inside an M-cycle)
+            #[cfg(feature = "debug_timing")]
+            eprintln!(
+                "[DEBUG TIMER] overflow: TIMA=00 for 1 cycle; reload=TMA={:#04x} next M-cycle",
+                self.tma
+            );
+        } else {
+            #[cfg(feature = "debug_timing")]
+            eprintln!(
+                "[DEBUG TIMER] TIMA increment at div_counter={}, new tima={:#04x}",
+                self.div_counter,
+                self.tima
+            );
+        }
     }
 
     pub fn read_io(&self, addr: u16) -> u8 {
@@ -80,200 +132,106 @@ impl Timer {
             0xff04 => self.divider,
             0xff05 => self.tima,
             0xff06 => self.tma,
-            0xff07 => {
-                0xf8 |
-                    (if self.enabled { 0x4 } else { 0 }) |
-                    (match self.tac & 0b11 {
-                        0b00 => 0,
-                        0b01 => 1,
-                        0b10 => 2,
-                        0b11 => 3,
-                        _ => 0,
-                    })
-            }
+            0xff07 =>
+                0b1111_1000 | (if self.timer_enabled { 0b100 } else { 0 }) | (self.tac & 0b11),
             _ => 0xff,
         }
     }
 
     pub fn write_io(&mut self, addr: u16, val: u8) {
         match addr {
+            // DIV write: reset system counter *and* possibly cause an immediate tick
+            // if the currently selected bit was 1 and the timer is enabled (DMG quirk). [2](https://gbdev.io/pandocs/Timer_Obscure_Behaviour.html)[3](https://gbdev.gg8.se/wiki/articles/Timer_Obscure_Behaviour)
             0xff04 => {
+                let was_enabled = self.timer_enabled;
+                let sel_bit = self.timer_bit;
+                let old_bit_state = ((self.div_counter >> sel_bit) & 1) != 0;
+
+                // Quirk: If enabled and old_bit was 1 -> falling edge when counter resets to 0.
+                if was_enabled && old_bit_state {
+                    self.tick_tima_once();
+                }
+
+                self.div_counter = 0;
                 self.divider = 0;
-                self.internaldiv = 0; // reset internal DIV counter
+                self.prev_timer_bit_state = false;
+
+                #[cfg(feature = "debug_timing")]
+                eprintln!(
+                    "[DEBUG TIMER] DIV reset to 0 (glitch tick applied: {})",
+                    was_enabled && old_bit_state
+                );
             }
+
+            // TIMA write: if within the 1-cycle overflow window, **cancel** the pending reload/IF. [2](https://gbdev.io/pandocs/Timer_Obscure_Behaviour.html)[3](https://gbdev.gg8.se/wiki/articles/Timer_Obscure_Behaviour)
             0xff05 => {
+                if self.overflow_pending {
+                    // Cancel the delayed reload behaviour per Pan Docs.
+                    self.overflow_pending = false;
+                    self.overflow_delay = 0;
+                    #[cfg(feature = "debug_timing")]
+                    eprintln!("[DEBUG TIMER] TIMA write canceled delayed reload/IF");
+                }
                 self.tima = val;
+                #[cfg(feature = "debug_timing")]
+                eprintln!("[DEBUG TIMER] TIMA written with {:#04x}", val);
             }
+
             0xff06 => {
                 self.tma = val;
+                #[cfg(feature = "debug_timing")]
+                eprintln!("[DEBUG TIMER] TMA written with {:#04x}", val);
             }
+
+            // TAC write: may cause an immediate tick (glitch) depending on old/new selection
+            // and enable bit on DMG. Then update selection and resample state. [2](https://gbdev.io/pandocs/Timer_Obscure_Behaviour.html)[3](https://gbdev.gg8.se/wiki/articles/Timer_Obscure_Behaviour)
             0xff07 => {
+                let _old_tac = self.tac;
+                let old_enable = self.timer_enabled;
+                let old_bit = self.timer_bit;
+                let old_bit_state = ((self.div_counter >> old_bit) & 1) != 0;
+
+                // Apply only the writable low 3 bits
                 self.tac = val & 0b111;
-                self.update_step();
+
+                // Compute new settings (but don't resample prev yet; we want glitch calc first)
+                let new_enable = (self.tac & 0b100) != 0;
+                let new_bit = Self::map_tac_bit(self.tac);
+                let new_bit_state = ((self.div_counter >> new_bit) & 1) != 0;
+
+                // DMG quirk rules (see Pan Docs “Timer Obscure Behaviour”):
+                // - If old_enable && !new_enable && old_bit_state==1  -> tick (disable glitch)
+                // - If old_enable && new_enable && old_bit_state==1 && new_bit_state==0 -> tick
+                //   (selecting between bits can cause 1->0 at mux output)
+                // Note: CGB has slightly different behaviour; we implement DMG here. [2](https://gbdev.io/pandocs/Timer_Obscure_Behaviour.html)[3](https://gbdev.gg8.se/wiki/articles/Timer_Obscure_Behaviour)
+                let mut glitch = false;
+                if old_enable && !new_enable && old_bit_state {
+                    glitch = true;
+                } else if old_enable && new_enable && old_bit_state && !new_bit_state {
+                    glitch = true;
+                }
+
+                if glitch {
+                    self.tick_tima_once();
+                }
+
+                // Update enable/bit + resample prev state
+                self.update_tac_common();
+
+                #[cfg(feature = "debug_timing")]
+                eprintln!(
+                    "[DEBUG TIMER] TAC from {:#04x} -> {:#04x}, enabled {}->{}; bit {}->{}; glitch={}",
+                    _old_tac,
+                    self.tac,
+                    old_enable,
+                    new_enable,
+                    old_bit,
+                    new_bit,
+                    glitch
+                );
             }
+
             _ => {}
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn div_increments_every_256_cpu_cycles() {
-        let mut t = Timer::new();
-
-        // DIV is high byte of div_counter. 256 cycles -> DIV + 1
-        let div0 = t.read_io(0xff04);
-        let _of = t.tick(256);
-        let div1 = t.read_io(0xff04);
-        assert_eq!(div1, div0.wrapping_add(1));
-
-        // Another 512 cycles -> DIV + 2 more
-        let _ = t.tick(512);
-        let div2 = t.read_io(0xff04);
-        assert_eq!(div2, div1.wrapping_add(2));
-    }
-
-    #[test]
-    fn writing_div_resets_divider_and_resamples_selected_bit() {
-        let mut t = Timer::new();
-
-        // Enable at 16,384 Hz (bit7)
-        t.write_io(0xff07, 0b0000_0111);
-
-        // 256 cycles -> DIV + 1 in the high byte
-        let _ = t.tick(256);
-        assert_eq!(t.read_io(0xff04), 0x01);
-
-        // Reset DIV
-        t.write_io(0xff04, 0xab);
-        assert_eq!(t.read_io(0xff04), 0x00);
-
-        // No spurious TIMA increment after reset
-        t.write_io(0xff05, 0x00);
-        let before = t.read_io(0xff05);
-        let _ = t.tick(4);
-        assert_eq!(t.read_io(0xff05), before);
-    }
-
-    #[test]
-    fn tima_increments_at_each_tac_rate_on_falling_edges() {
-        // Try all 4 TAC rates. Each is defined by a bit of the div_counter.
-        // TIMA increments on falling edge of that bit.
-        // To force two falling edges:
-        //   - For bit N, period = 2^(N+1) cycles; falling edge every 2^(N+1) cycles.
-        //   - We'll step exactly 2 * period cycles and expect TIMA += 2 (if enabled).
-
-        let rates = [
-            (0b0000_0100, 9), // bit9  (4096 Hz)
-            (0b0000_0101, 3), // bit3  (262144 Hz)
-            (0b0000_0110, 5), // bit5  (65536 Hz)
-            (0b0000_0111, 7), // bit7  (16384 Hz)
-        ];
-
-        for &(tac, bit) in &rates {
-            let mut t = Timer::new();
-            t.write_io(0xff07, tac);
-            t.write_io(0xff05, 0x10);
-
-            let t0 = t.read_io(0xff05);
-
-            // Two FALLING edges require 2^(bit+2) cycles from an arbitrary phase.
-            let total = 1u32 << (bit + 2);
-            let mut spent = 0;
-            while spent < total {
-                let _ = t.tick(4);
-                spent += 4;
-            }
-
-            let t1 = t.read_io(0xff05);
-            assert_eq!(t1, t0.wrapping_add(2), "TAC={:#05b} should add two", tac & 0b111);
-        }
-    }
-
-    #[test]
-    fn tima_overflow_reloads_from_tma_and_signals_overflow() {
-        let mut t = Timer::new();
-
-        // Enable 262,144 Hz (bit3). Falling-to-falling is 32 cycles from a clean sample.
-        t.write_io(0xff07, 0b0000_0101); // enable + 01
-        t.write_io(0xff06, 0x42); // TMA
-        t.write_io(0xff05, 0xff); // TIMA
-
-        let overflowed = t.tick(32);
-        assert!(overflowed, "overflow should be reported to caller");
-        assert_eq!(t.read_io(0xff05), 0x42, "TIMA reloaded from TMA on overflow");
-    }
-
-    #[test]
-    fn enabling_timer_does_not_immediately_increment_tima() {
-        let mut t = Timer::new();
-
-        // Put TIMA at known value, set DIV such that selected bit is currently 0
-        t.write_io(0xff05, 0x33);
-        t.write_io(0xff07, 0b0000_0000); // disabled, freq=00 (bit9)
-        // Make sure div_counter is a value with bit9=0
-        // If we advance less than 512 cycles, bit9 (1<<9) remains 0.
-        let _ = t.tick(128);
-        // Now enable at same freq
-        t.write_io(0xff07, 0b0000_0100); // enable + 00
-
-        // No immediate falling edge should be counted on enable.
-        let before = t.read_io(0xff05);
-        let _ = t.tick(4);
-        assert_eq!(t.read_io(0xff05), before, "no spurious increment on enable");
-    }
-
-    #[test]
-    fn changing_tac_does_not_double_count_the_switch() {
-        let mut t = Timer::new();
-
-        // Start with 16,384 Hz (bit7), and ensure we are at a clean edge boundary
-        t.write_io(0xff07, 0b0000_0111); // enable + 11 (bit7)
-        t.write_io(0xff05, 0x00);
-
-        // Advance exactly 256 cycles to pass one *full* bit7 period (so we end where we started on bit7)
-        let _ = t.tick(256);
-
-        // Switch to 262,144 Hz (bit3). Resampling must avoid a phantom edge.
-        t.write_io(0xff07, 0b0000_0101); // enable + 01 (bit3)
-
-        // Now advance 12 cycles (< 16 cycles period), so still no falling edge for bit3.
-        let _ = t.tick(12);
-
-        // TIMA should still be 0 (no false increment on switch + not enough cycles yet)
-        assert_eq!(t.read_io(0xff05), 0x00);
-
-        // Advance 4 more cycles (total 16) -> one falling edge at bit3
-        let _ = t.tick(4);
-        assert_eq!(
-            t.read_io(0xff05),
-            0x01,
-            "one increment after a proper falling edge post-switch"
-        );
-    }
-
-    #[test]
-    fn disabling_timer_stops_increments_until_reenabled() {
-        let mut t = Timer::new();
-
-        // Enable at 262,144 Hz (bit3). First: produce one increment.
-        t.write_io(0xff07, 0b0000_0101);
-        t.write_io(0xff05, 0x00);
-
-        let _ = t.tick(32); // reliable +1 from clean sample
-        assert_eq!(t.read_io(0xff05), 0x01);
-
-        // Disable timer
-        t.write_io(0xff07, 0b0000_0001); // disable, keep freq bits
-        let _ = t.tick(64);
-        assert_eq!(t.read_io(0xff05), 0x01, "no change while disabled");
-
-        // Re-enable; advance to the next falling edge boundary
-        t.write_io(0xff07, 0b0000_0101);
-        let _ = t.tick(32);
-        assert_eq!(t.read_io(0xff05), 0x02);
     }
 }

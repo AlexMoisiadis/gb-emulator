@@ -2,17 +2,18 @@
 use gb_emulator::{ CPU, MemoryBus };
 use gb_emulator::gpu::DebugOverlayConfig;
 
-use std::sync::Arc;
-use std::time::{ Duration, Instant };
-use std::{ fs::File, path::Path };
-
+use anyhow::Result;
 use pixels::{ Pixels, SurfaceTexture };
 use png::{ BitDepth, ColorType, Encoder };
+use std::fs::File;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{ Duration, Instant };
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
     event::{ ElementState, KeyEvent, StartCause, WindowEvent },
-    event_loop::EventLoop, // intentionally not importing ControlFlow to avoid warnings
+    event_loop::EventLoop, // keep ControlFlow path-qualified to avoid warnings
     keyboard::{ KeyCode, PhysicalKey },
     window::{ Window, WindowId },
 };
@@ -21,11 +22,11 @@ const W: usize = 160;
 const H: usize = 144;
 type Framebuffer = [[u8; W]; H];
 
-// DMG timing
+// DMG timing (one LCD frame)
 const DMG_DOTS_PER_FRAME: u32 = 70_224;
 const DMG_CLOCK_HZ: u32 = 4_194_304;
 
-// ~16.743 ms without floating error
+// ~16.743 ms (exact ratio w/out fp drift)
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 const FRAME_NS: u128 = (NANOS_PER_SEC * (DMG_DOTS_PER_FRAME as u128)) / (DMG_CLOCK_HZ as u128);
 const FRAME_DT: Duration = Duration::from_nanos(FRAME_NS as u64);
@@ -56,31 +57,48 @@ struct App {
     o_axes: bool,
     o_sprites: bool,
 
+    // Screenshots
     screenshot_id: u32,
 
     // Frame cadence & state
     next_deadline: Instant,
     needs_present: bool,
 
-    // Guards to prevent re-entrancy and nested compute
+    // Guards to prevent re-entrancy
     in_redraw: bool,
     in_compute: bool,
+
+    // Capture control
     frame_count: u32,
+    capture_first_n: u32,
+    captured_so_far: u32,
+    capture_prefix: String,
+    capture_skip: u32,
 }
 
 impl App {
-    fn new(rom_path: String) -> anyhow::Result<Self> {
+    fn new(rom_path: String) -> Result<Self> {
         let mut cpu = Box::new(CPU::new());
         let mut bus = Box::new(MemoryBus::new());
         post_boot_init(&mut cpu, &mut bus);
 
         // Overlays default; toggle via hotkeys
         let (o_grid, o_window, o_axes, o_sprites) = (true, true, false, true);
-        // apply_overlay(&mut bus, o_grid, o_window, o_axes, o_sprites);
 
         // Load ROM
         let rom = std::fs::read(rom_path)?;
         bus.load_rom(&rom);
+
+        // Optional auto-capture controls via env
+        let capture_first_n = std::env
+            ::var("GB_CAPTURE_FIRST_N")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(10);
+
+        let capture_prefix = std::env
+            ::var("GB_CAPTURE_PREFIX")
+            .unwrap_or_else(|_| "boot-frame".into());
 
         Ok(Self {
             window: None,
@@ -98,10 +116,19 @@ impl App {
             in_redraw: false,
             in_compute: false,
             frame_count: 0,
+            capture_first_n,
+            captured_so_far: 0,
+            capture_skip: 8, // skip first N frames before capturing
+            capture_prefix,
         })
     }
 
-    fn save_png<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
+    #[inline]
+    fn window_id(&self) -> Option<WindowId> {
+        self.window.as_ref().map(|w| w.id())
+    }
+
+    fn save_png<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let mut gray = vec![0u8; W * H];
         for y in 0..H {
             for x in 0..W {
@@ -117,9 +144,78 @@ impl App {
         Ok(())
     }
 
-    #[inline]
-    fn window_id(&self) -> Option<WindowId> {
-        self.window.as_ref().map(|w| w.id())
+    /// Uploads the current framebuffer to the Pixels surface and renders it.
+    fn present_current_frame(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        // Copy finished frame from PPU (we only copy if we decided to present)
+        self.bus.gpu.copy_frame(&mut self.fb);
+
+        if let Some(pixels) = &mut self.pixels {
+            let frame: &mut [u8] = pixels.frame_mut();
+            for y in 0..H {
+                for x in 0..W {
+                    let v = dmg_shade_to_u8(self.fb[y][x]);
+                    let i = (y * W + x) * 4;
+                    frame[i + 0] = v;
+                    frame[i + 1] = v;
+                    frame[i + 2] = v;
+                    frame[i + 3] = 0xff;
+                }
+            }
+            if let Err(e) = pixels.render() {
+                eprintln!("pixels.render() failed: {e}");
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// Run CPU/PPU for one full frame of PPU dots. Returns true if a frame should be presented.
+    fn step_one_frame(&mut self) -> bool {
+        let mut tcycles: u32 = 0;
+        let mut saw_frame_ready = false;
+
+        while tcycles < DMG_DOTS_PER_FRAME {
+            if !saw_frame_ready && self.bus.gpu.frame_is_ready() {
+                saw_frame_ready = true;
+            }
+            let cy = self.cpu.step(&mut self.bus);
+            tcycles = tcycles.saturating_add(cy);
+        }
+
+        let mut should_present = false;
+
+        if saw_frame_ready && self.bus.gpu.take_frame_ready() {
+            self.frame_count = self.frame_count.saturating_add(1);
+            should_present = true;
+
+            // Optional: Skip first N frames, then capture next M frames
+            if self.frame_count > self.capture_skip && self.captured_so_far < self.capture_first_n {
+                // Copy frame (we will present anyway, but we capture now from the fresh PPU buffer)
+                self.bus.gpu.copy_frame(&mut self.fb);
+                let idx = self.captured_so_far + 1;
+                let filename = format!("{}-{:03}.png", self.capture_prefix, idx);
+                match self.save_png(&filename) {
+                    Ok(()) => {
+                        #[cfg(any(feature = "trace_ppu", feature = "debug_timing"))]
+                        eprintln!("Captured {}", filename);
+                    }
+                    Err(e) => eprintln!("Capture failed: {e}"),
+                }
+                self.captured_so_far = self.captured_so_far.saturating_add(1);
+            }
+        }
+
+        #[cfg(any(feature = "trace_ppu", feature = "debug_timing"))]
+        {
+            eprintln!(
+                "frame done: should_present={}, level_now={}, ly={}",
+                should_present,
+                self.bus.gpu.frame_is_ready(),
+                self.bus.gpu.ly()
+            );
+            eprintln!("LYC={} STAT={:02X}", self.bus.read_byte(0xff45), self.bus.read_byte(0xff41));
+        }
+
+        should_present
     }
 }
 
@@ -147,7 +243,7 @@ impl ApplicationHandler for App {
             self.window = Some(window.clone());
             self.pixels = Some(pixels);
 
-            // Optional one-time kick; you can comment it out if you prefer cadence-only
+            // Optional one-time kick; cadence will take over anyway
             window.request_redraw();
         }
     }
@@ -171,7 +267,6 @@ impl ApplicationHandler for App {
                 if let Some(pixels) = &mut self.pixels {
                     if let Err(e) = pixels.resize_surface(size.width, size.height) {
                         eprintln!("pixels.resize_surface failed: {e}");
-                        // event_loop.exit();
                     }
                 }
             }
@@ -179,37 +274,13 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 // Guard against nested delivery of RedrawRequested
                 if self.in_redraw {
-                    // Skip nested redraw to avoid stack growth on platforms that re-enter
-                    return;
+                    return; // Skip nested redraw to avoid stack growth
                 }
                 self.in_redraw = true;
 
-                // Only present if a frame is ready (compute happens in about_to_wait)
                 if self.needs_present {
                     self.needs_present = false;
-
-                    // Copy finished frame from PPU
-                    self.bus.gpu.copy_frame(&mut self.fb);
-
-                    if let Some(pixels) = &mut self.pixels {
-                        let frame: &mut [u8] = pixels.frame_mut();
-                        for y in 0..H {
-                            for x in 0..W {
-                                let v = dmg_shade_to_u8(self.fb[y][x]);
-                                let i = (y * W + x) * 4;
-                                frame[i + 0] = v;
-                                frame[i + 1] = v;
-                                frame[i + 2] = v;
-                                frame[i + 3] = 0xff;
-                            }
-                        }
-                        if let Err(e) = pixels.render() {
-                            eprintln!("pixels.render() failed: {e}");
-                            event_loop.exit();
-                            self.in_redraw = false;
-                            return;
-                        }
-                    }
+                    self.present_current_frame(event_loop);
                 }
 
                 self.in_redraw = false;
@@ -217,21 +288,28 @@ impl ApplicationHandler for App {
 
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key, state, .. }, .. } => {
                 if state == ElementState::Pressed {
+                    let mut overlay_changed = false;
                     match physical_key {
                         PhysicalKey::Code(KeyCode::KeyG) => {
                             self.o_grid = !self.o_grid;
+                            overlay_changed = true;
                         }
                         PhysicalKey::Code(KeyCode::KeyW) => {
                             self.o_window = !self.o_window;
+                            overlay_changed = true;
                         }
                         PhysicalKey::Code(KeyCode::KeyA) => {
                             self.o_axes = !self.o_axes;
+                            overlay_changed = true;
                         }
                         PhysicalKey::Code(KeyCode::KeyS) => {
                             self.o_sprites = !self.o_sprites;
+                            overlay_changed = true;
                         }
                         PhysicalKey::Code(KeyCode::F9) => {
                             self.screenshot_id = self.screenshot_id.wrapping_add(1);
+                            // Copy latest frame before saving
+                            self.bus.gpu.copy_frame(&mut self.fb);
                             let filename = format!("acid2-capture-{:03}.png", self.screenshot_id);
                             match self.save_png(&filename) {
                                 Ok(()) => eprintln!("Saved {}", filename),
@@ -241,13 +319,16 @@ impl ApplicationHandler for App {
                         PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
                         _ => {}
                     }
-                    apply_overlay(
-                        &mut self.bus,
-                        self.o_grid,
-                        self.o_window,
-                        self.o_axes,
-                        self.o_sprites
-                    );
+
+                    if overlay_changed {
+                        apply_overlay(
+                            &mut self.bus,
+                            self.o_grid,
+                            self.o_window,
+                            self.o_axes,
+                            self.o_sprites
+                        );
+                    }
                 }
             }
 
@@ -260,118 +341,53 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        // Set deadline-based wakeup so winit doesn't sleep indefinitely
+        // Drive cadence (decoupled compute from redraw)
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(self.next_deadline));
-
         let now = Instant::now();
+
         if now >= self.next_deadline {
+            // Avoid re-entrant compute if platform schedules tightly
             if self.in_compute {
                 self.next_deadline = now + FRAME_DT;
                 return;
             }
             self.in_compute = true;
 
-            let mut safety_tcycles = 0u32;
-            while !self.bus.gpu.frame_is_ready() && safety_tcycles < 70_224 {
-                let cy = self.cpu.step(&mut self.bus);
-                safety_tcycles = safety_tcycles.saturating_add(cy);
-            }
+            // Step one whole frame worth of work
+            let present = self.step_one_frame();
 
-            // In about_to_wait, after the first frame:
-            if safety_tcycles == 65664 || self.screenshot_id == 0 {
-                eprintln!(
-                    "LCDC={:02X} BGP={:02X} OBP0={:02X} OBP1={:02X} SCX={} SCY={} WX={} WY={}",
-                    self.bus.gpu.get_lcdc(),
-                    self.bus.gpu.get_bgp(),
-                    self.bus.gpu.get_obp0(),
-                    self.bus.gpu.get_obp1(),
-                    self.bus.gpu.get_scx(),
-                    self.bus.gpu.get_scy(),
-                    self.bus.gpu.get_wx(),
-                    self.bus.gpu.get_wy()
-                );
-                // Also dump first 32 bytes of OAM
-                for i in 0..8 {
-                    eprintln!(
-                        "OAM[{}]: y={} x={} tile={} attr={:02X}",
-                        i,
-                        self.bus.gpu.read_oam(i * 4),
-                        self.bus.gpu.read_oam(i * 4 + 1),
-                        self.bus.gpu.read_oam(i * 4 + 2),
-                        self.bus.gpu.read_oam(i * 4 + 3)
-                    );
-                }
-                for i in 0..32u16 {
-                    let byte = self.bus.read_byte(0x9c00 + i);
-                    eprint!("{:02X} ", byte);
-                }
-                // Dump tile 163 (used by sprites per OAM) raw bytes
-                for i in 0..16u16 {
-                    let byte = self.bus.read_byte(0x8000 + 163 * 16 + i);
-                    eprint!("{:02X} ", byte);
-                }
-                eprintln!(" <-- tile 163 pattern");
-                eprintln!(" <-- 0x9C00 row 0");
-            }
-
-            // Temporary: print state after each frame
-            eprintln!(
-                "frame done: safety_tcycles={}, frame_ready={}, ly={}",
-                safety_tcycles,
-                self.bus.gpu.frame_is_ready(),
-                self.bus.gpu.ly()
-            );
-
-            if self.bus.gpu.take_frame_ready() {
-                self.frame_count += 1;
+            if present {
                 self.needs_present = true;
-
-                if self.bus.gpu.get_lcdc() == 0xf3 && self.frame_count > 5 {
-                    let filename = format!("auto-lcdc-f3-{}.png", self.frame_count);
-                    if let Err(e) = self.save_png(&filename) {
-                        eprintln!("auto-save failed: {e}");
-                    } else {
-                        eprintln!("Auto-saved {filename}");
-                        self.frame_count = 0;
-                    }
+                if let Some(win) = &self.window {
+                    win.request_redraw();
                 }
             }
 
             self.next_deadline = now + FRAME_DT;
             self.in_compute = false;
-
-            // Request redraw AFTER releasing in_compute
-            if self.needs_present {
-                if let Some(win) = &self.window {
-                    win.request_redraw();
-                }
-            }
         }
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     let rom_path = std::env::args().nth(1).expect("Usage: viewer <path.gb>");
-
     let mut app = App::new(rom_path)?; // propagate errors
-
-    let event_loop = EventLoop::new()?; // returns Result in 0.30.x
-    event_loop.run_app(&mut app)?; // also returns Result
+    let event_loop = EventLoop::new()?; // winit 0.30.x returns Result
+    event_loop.run_app(&mut app)?; // returns Result
     Ok(())
 }
 
 // ----- helpers -----
-
 fn apply_overlay(bus: &mut MemoryBus, grid: bool, window: bool, axes: bool, sprites: bool) {
     let mut cfg = DebugOverlayConfig::default();
     cfg.show_bg_tile_grid = grid;
     cfg.show_window_bounds = window;
     cfg.show_bg_axes = axes;
     cfg.show_sprite_boxes = sprites;
-    cfg.shade_grid = 3;
-    cfg.shade_window = 2;
+    cfg.shade_grid = 1;
+    cfg.shade_window = 1;
     cfg.shade_axes = 1;
-    cfg.shade_sprite_box = 3;
+    cfg.shade_sprite_box = 2;
     bus.set_gpu_debug_config(cfg);
 }
 
@@ -383,6 +399,7 @@ fn post_boot_init(cpu: &mut CPU, bus: &mut MemoryBus) {
     cpu.sp = 0xfffe;
     cpu.pc = 0x0100;
 
+    // Initial LCD state
     bus.write_byte(0xff40, 0x91); // LCDC
     bus.write_byte(0xff42, 0x00); // SCY
     bus.write_byte(0xff43, 0x00); // SCX

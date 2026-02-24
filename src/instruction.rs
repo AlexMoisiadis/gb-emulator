@@ -64,6 +64,11 @@ pub enum Instruction {
     OrA(LoadByteSource),
     CpA(LoadByteSource),
 
+    RRA, // 0x1F
+    RLCA,
+    RLA,
+    RRCA,
+
     DAA,
     CPL,
     SCF,
@@ -99,6 +104,8 @@ pub enum Instruction {
     // Misc
     NOP, // 0x00
     HALT, // 0x76
+    STOP, // 0x10
+
     AddHL(Reg16),
 }
 
@@ -277,6 +284,21 @@ impl Instruction {
     fn from_byte_not_prefixed(byte: u8) -> Result<Instruction, DecodeError> {
         // --- Single-byte explicit instructions ---
         match byte {
+            0x10 => {
+                return Ok(Instruction::STOP);
+            }
+            0x07 => {
+                return Ok(Instruction::RLCA);
+            }
+            0x17 => {
+                return Ok(Instruction::RLA);
+            }
+            0x0f => {
+                return Ok(Instruction::RRCA);
+            }
+            0x1f => {
+                return Ok(Instruction::RRA);
+            }
             0x27 => {
                 return Ok(Instruction::DAA);
             }

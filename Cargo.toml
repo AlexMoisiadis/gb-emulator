@@ -14,3 +14,7 @@ bitflags = "2.11.0"
 # Optional now; add later when you wire audio
 # cpal   = "0.15"
 # gilrs  = "0.10"       # gamepads
+
+[features]
+debug_timing = []
+trace_ppu = []

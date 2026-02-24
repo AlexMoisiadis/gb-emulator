@@ -1,24 +1,20 @@
 // src/gpu.rs
-use std::array::from_fn;
-// use crate::bus::MemoryBus;
+//
+// DMG PPU timing fix:
+// - Consume all tcycles in GPU::tick (no early returns on IF)
+// - Constant 456 dots per line (Mode3=172 nominal on DMG)
+// - Single VBlank IF raise on entering LY=144
+// - STAT rising-edge aggregation without stopping time
 
-/// Game Boy VRAM window for tile/tilemap data.
-/// (DMG/CGB share this base window; banking is not modeled here.)
+use std::array::from_fn;
+
 pub const VRAM_BEGIN: u16 = 0x8000;
 pub const VRAM_END: u16 = 0x9fff;
 pub const VRAM_SIZE: usize = (VRAM_END as usize) - (VRAM_BEGIN as usize) + 1;
 
-/// Number of tiles in the 0x8000 tile data block on DMG (256+128)
-/// - 0x8000-0x8FFF: 256 tiles (unsigned index mode)
-/// - 0x9000-0x97FF: 128 tiles (signed index mode base)
-/// We cache 384 tiles total (indices 0..383).
 pub const TILE_COUNT: usize = 384;
-
-/// The first 0x1800 bytes (0x8000..=0x97FF) are tile pattern data.
-/// The rest contains tile maps (0x9800..=0x9FFF).
 const TILE_DATA_LEN: usize = 0x1800; // 6 KiB
 
-/// LCD dimensions (visible screen)
 pub const LCD_WIDTH: usize = 160;
 pub const LCD_HEIGHT: usize = 144;
 
@@ -28,15 +24,15 @@ bitflags::bitflags! {
     pub struct IfBits: u8 {
         const VBLANK   = 0b0000_0001;
         const LCD_STAT = 0b0000_0010;
-        // (Timer/Serial/Joypad if you want them later)
     }
 }
 
 pub struct GpuEvents {
-    pub if_set: IfBits, // which IF bits to OR into 0xFF0F
+    pub if_set: IfBits,
     pub frame_became_ready: bool,
 }
 
+#[derive(Copy, Clone, Debug)]
 enum PpuMode {
     HBlank0,
     VBlank1,
@@ -46,58 +42,13 @@ enum PpuMode {
 
 impl PpuMode {
     #[inline]
-    fn stat_bits(&self) -> u8 {
-        match *self {
+    fn stat_bits(self) -> u8 {
+        match self {
             PpuMode::HBlank0 => 0,
             PpuMode::VBlank1 => 1,
             PpuMode::Oam2 => 2,
             PpuMode::Xfer3 => 3,
         }
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct DebugOverlayConfig {
-    /// Draw BG tile grid every 8 pixels in screen space, taking SCX/SCY into account.
-    pub show_bg_tile_grid: bool,
-    /// Outline the Window: top border at WY, left border at WX-7 when the window is enabled.
-    pub show_window_bounds: bool,
-    /// Draw axes for the BG origin (SCX=0 vertical line, SCY=0 horizontal line) if visible.
-    pub show_bg_axes: bool,
-    /// Draw 8×8 / 8×16 OBJ bounding boxes using OAM entries (all 40 are considered).
-    pub show_sprite_boxes: bool,
-    /// Shade (0..3) used for grid lines.
-    pub shade_grid: u8,
-    /// Shade (0..3) used for window bounds.
-    pub shade_window: u8,
-    /// Shade (0..3) used for BG axes.
-    pub shade_axes: u8,
-    /// Shade (0..3) used for sprite boxes.
-    pub shade_sprite_box: u8,
-}
-
-impl Default for DebugOverlayConfig {
-    fn default() -> Self {
-        Self {
-            show_bg_tile_grid: false,
-            show_window_bounds: false,
-            show_bg_axes: false,
-            show_sprite_boxes: false,
-            // choose dark shades for overlays so they are visible on all palettes
-            shade_grid: 3,
-            shade_window: 2,
-            shade_axes: 1,
-            shade_sprite_box: 3,
-        }
-    }
-}
-
-impl DebugOverlayConfig {
-    pub fn any_enabled(&self) -> bool {
-        self.show_bg_tile_grid ||
-            self.show_window_bounds ||
-            self.show_bg_axes ||
-            self.show_sprite_boxes
     }
 }
 
@@ -114,42 +65,97 @@ const fn empty_tile() -> Tile {
     [[TilePixelValue::Zero; 8]; 8]
 }
 
+pub trait DmaRead {
+    fn read8(&mut self, addr: u16) -> u8;
+}
+
 pub struct GPU {
-    // VRAM contents
+    // VRAM + tile cache
     vram: [u8; VRAM_SIZE],
-    // Decoded tiles cache (2bpp -> 4 color indices)
     tile_set: [Tile; TILE_COUNT],
 
-    // --- PPU-visible registers (DMG subset) ---
-    lcdc: u8, // LCD Control (FF40)
-    scy: u8, // Scroll Y (FF42)
-    scx: u8, // Scroll X (FF43)
-    wy: u8, // Window Y (FF4A)
-    wx: u8, // Window X (FF4B) (note: internal uses WX-7)
-    bgp: u8, // BG Palette (FF47) (DMG only)
+    // Registers (DMG subset)
+    lcdc: u8,
+    scy: u8,
+    scx: u8,
+    wy: u8,
+    wx: u8,
+    bgp: u8,
 
-    // --- OAM (Object Attribute Memory) ---
-    oam: [u8; 160], // 40 sprites * 4 bytes
+    // OAM and OBJ palettes
+    oam: [u8; 160],
+    obp0: u8,
+    obp1: u8,
 
-    // --- OBJ palettes (DMG) ---
-    obp0: u8, // FF48
-    obp1: u8, // FF49
-    stat: u8, // mirror ff1
-
-    // --- Scratch: BG raw color indices for current scanline (0..3) ---
+    // Per-scanline BG raw indices
     bg_idx_line: [u8; LCD_WIDTH],
 
-    // --- Window internal line counter (DMG-accurate) ---
+    // Window internal line counter
     window_line_counter: u8,
-    // --- Debug overlay configuration (all off by default) ---
+
+    // Debug overlay
     debug: DebugOverlayConfig,
+
+    // PPU state
     mode: PpuMode,
-    dot_in_mode: u16,
+    dot_in_mode: u16, // 0..=455 across a line (we clamp per-mode)
     ly: u8,
     frame_ready: bool,
     framebuf: [[u8; LCD_WIDTH]; LCD_HEIGHT],
-    lyc: u8, // mirror ff45
+    stat: u8,
+    lyc: u8,
     lyc_irq_pending: bool,
+
+    // OAM DMA (FF46)
+    dma_active: bool,
+    dma_src_high: u8,
+    dma_byte_idx: u16,
+    dma_mcycles_left: u16,
+
+    // For Mode 3 length (DMG nominal, kept constant here)
+    sprites_on_line_count: u8,
+    stat_irq_line_prev: bool,
+
+    // Window latches
+    wy_latched_this_line: bool,
+    wx_latched_for_line: u8,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct DebugOverlayConfig {
+    pub show_bg_tile_grid: bool,
+    pub show_window_bounds: bool,
+    pub show_bg_axes: bool,
+    pub show_sprite_boxes: bool,
+    pub shade_grid: u8,
+    pub shade_window: u8,
+    pub shade_axes: u8,
+    pub shade_sprite_box: u8,
+}
+
+impl Default for DebugOverlayConfig {
+    fn default() -> Self {
+        Self {
+            show_bg_tile_grid: false,
+            show_window_bounds: false,
+            show_bg_axes: false,
+            show_sprite_boxes: false,
+            shade_grid: 3,
+            shade_window: 2,
+            shade_axes: 1,
+            shade_sprite_box: 3,
+        }
+    }
+}
+
+impl DebugOverlayConfig {
+    #[inline]
+    pub fn any_enabled(&self) -> bool {
+        self.show_bg_tile_grid ||
+            self.show_window_bounds ||
+            self.show_bg_axes ||
+            self.show_sprite_boxes
+    }
 }
 
 impl GPU {
@@ -157,13 +163,11 @@ impl GPU {
         Self {
             vram: [0; VRAM_SIZE],
             tile_set: from_fn(|_| empty_tile()),
-            // Common defaults: LCD on + BG/window on + unsigned tiles + BG map 0
             lcdc: 0x91,
             scy: 0,
             scx: 0,
             wy: 0,
             wx: 0,
-            // Typical DMG defaults (boot ROM often sets BGP=0xFC)
             bgp: 0xfc,
             oam: [0; 160],
             obp0: 0xff,
@@ -179,15 +183,40 @@ impl GPU {
             stat: 0,
             lyc: 0,
             lyc_irq_pending: false,
+            dma_active: false,
+            dma_src_high: 0,
+            dma_byte_idx: 0,
+            dma_mcycles_left: 0,
+            sprites_on_line_count: 0,
+            stat_irq_line_prev: false,
+            wy_latched_this_line: false,
+            wx_latched_for_line: 0,
         }
     }
 
-    /// Call this at LY=0 (start of a new frame / after VBlank)
-    /// Resets the window internal line counter per Pan Docs.
+    #[inline]
+    fn stat_line_active_now(&self) -> bool {
+        let lyc_src = (self.stat & (1 << 6)) != 0 && self.ly == self.lyc;
+        let m0_src = (self.stat & (1 << 3)) != 0 && matches!(self.mode, PpuMode::HBlank0);
+        let m1_src = (self.stat & (1 << 4)) != 0 && matches!(self.mode, PpuMode::VBlank1);
+        let m2_src = (self.stat & (1 << 5)) != 0 && matches!(self.mode, PpuMode::Oam2);
+        lyc_src || m0_src || m1_src || m2_src
+    }
+
+    #[inline]
+    fn maybe_raise_stat_irq(&mut self, events: &mut GpuEvents) {
+        let now = self.stat_line_active_now();
+        if now && !self.stat_irq_line_prev {
+            events.if_set |= IfBits::LCD_STAT; // rising edge
+        }
+        self.stat_irq_line_prev = now;
+    }
+
     pub fn begin_frame(&mut self) {
         self.window_line_counter = 0;
     }
 
+    // --------- register-ish API ----------
     pub fn write_lyc(&mut self, v: u8) {
         self.lyc = v;
         let equal = self.ly == self.lyc;
@@ -201,19 +230,18 @@ impl GPU {
         }
     }
 
+    #[inline]
     pub fn take_lyc_irq_pending(&mut self) -> bool {
         let p = self.lyc_irq_pending;
         self.lyc_irq_pending = false;
         p
     }
-
     #[inline]
     pub fn ly(&self) -> u8 {
         self.ly
     }
     #[inline]
     pub fn write_stat(&mut self, v: u8) {
-        // Bits 0-2 are read-only; only accept bits 3-6 from CPU writes
         self.stat = (self.stat & 0x07) | (v & 0x78);
     }
     #[inline]
@@ -221,12 +249,10 @@ impl GPU {
         let coinc = if self.ly == self.lyc { 1 << 2 } else { 0 };
         (self.stat & !(1 << 2)) | coinc | 0x80
     }
-
     #[inline]
     pub fn read_lyc(&self) -> u8 {
         self.lyc
     }
-
     #[inline]
     pub fn frame_is_ready(&self) -> bool {
         self.frame_ready
@@ -242,9 +268,7 @@ impl GPU {
         *out = self.framebuf;
     }
 
-    // ---------------------------
-    // OBJ palette accessors
-    // ---------------------------
+    // OBJ palettes
     #[inline]
     pub fn set_obp0(&mut self, v: u8) {
         self.obp0 = v;
@@ -262,9 +286,7 @@ impl GPU {
         self.obp1
     }
 
-    // ---------------------------
-    // OAM read/write (index 0..159)
-    // ---------------------------
+    // OAM access
     #[inline]
     pub fn read_oam(&self, i: usize) -> u8 {
         self.oam.get(i).copied().unwrap_or(0)
@@ -276,9 +298,7 @@ impl GPU {
         }
     }
 
-    // ---------------------------
-    // Register accessors
-    // ---------------------------
+    // LCDC & scroll
     #[inline]
     pub fn set_lcdc(&mut self, v: u8) {
         self.lcdc = v;
@@ -328,122 +348,205 @@ impl GPU {
     pub fn get_bgp(&self) -> u8 {
         self.bgp
     }
+    #[inline]
+    pub fn mode_code(&self) -> u8 {
+        self.mode.stat_bits()
+    }
 
-    /// Advance the PPU by `dots` (PPU "T-cycles"/dots). If your CPU returns M-cycles, multiply by 4 before calling.
-    pub fn tick(&mut self, mut dots: u32) -> GpuEvents {
+    // --------- timing & DMA ----------
+    #[inline]
+    fn compute_mode3_length(&self) -> u16 {
+        // Fixed nominal for DMG: keep line length = 456 dots
+        // (Reintroduce variability behind a feature if you want)
+        172
+    }
+
+    pub fn tick<D: DmaRead>(&mut self, mut tcycles: u32, dma: &mut D) -> GpuEvents {
+        const LINE_DOTS: u16 = 456;
+        const MODE2_OAM: u16 = 80;
+        const MODE3_XFER: u16 = 172; // nominal DMG
+        const MODE0_HBLK: u16 = LINE_DOTS - MODE2_OAM - MODE3_XFER;
+
         let mut events = GpuEvents { if_set: IfBits::empty(), frame_became_ready: false };
 
-        while dots > 0 {
-            // --- per-mode remaining length ---
-            let mode_len: u16 = match self.mode {
-                PpuMode::Oam2 => 80,
-                PpuMode::Xfer3 => 172, // simple scanline renderer is OK for acid2
-                PpuMode::HBlank0 => 456 - 80 - 172,
-                PpuMode::VBlank1 => 456,
-            };
+        while tcycles > 0 {
+            tcycles -= 1;
 
-            let rem = mode_len - self.dot_in_mode;
-            let step = rem.min(dots as u16);
-            self.dot_in_mode += step;
-            dots -= step as u32;
+            // 1 byte per M-cycle during OAM DMA
+            self.step_oam_dma(dma);
 
-            if self.dot_in_mode == mode_len {
-                self.dot_in_mode = 0;
-
-                match self.mode {
-                    PpuMode::Oam2 => {
-                        self.set_stat_mode(PpuMode::Xfer3, &mut events);
-                        self.mode = PpuMode::Xfer3;
-                    }
-                    PpuMode::Xfer3 => {
-                        if self.ly < (LCD_HEIGHT as u8) {
-                            let mut line = [0u8; LCD_WIDTH];
-                            self.render_scanline(self.ly, &mut line);
-                            self.render_scanline_objs(self.ly, &mut line);
-                            self.overlay_debug_scanline(self.ly, &mut line);
-                            self.framebuf[self.ly as usize].copy_from_slice(&line);
-                        }
-                        self.set_stat_mode(PpuMode::HBlank0, &mut events);
-                        self.mode = PpuMode::HBlank0;
-                    }
-                    PpuMode::HBlank0 => {
+            match self.mode {
+                PpuMode::HBlank0 => {
+                    self.dot_in_mode = self.dot_in_mode.saturating_add(1);
+                    if self.dot_in_mode >= MODE0_HBLK {
+                        self.dot_in_mode = 0;
+                        // End of scanline: advance LY and decide next mode
                         self.ly = self.ly.wrapping_add(1);
+
                         if self.ly == 144 {
-                            self.frame_ready = true;
-                            events.frame_became_ready = true;
-                            events.if_set |= IfBits::VBLANK;
-                            self.set_stat_mode(PpuMode::VBlank1, &mut events);
+                            // Enter VBlank
                             self.mode = PpuMode::VBlank1;
-                        } else {
-                            self.set_stat_mode(PpuMode::Oam2, &mut events);
+                            self.set_stat_mode(PpuMode::VBlank1, &mut events);
+
+                            // Raise VBlank IF exactly once (on entry to LY=144)
+                            events.if_set |= IfBits::VBLANK;
+                            if !self.frame_ready {
+                                self.frame_ready = true;
+                                events.frame_became_ready = true;
+                            }
+                            self.update_ly_and_lyc(&mut events);
+                        } else if self.ly < 144 {
+                            // Start of a visible scanline: Mode 2
                             self.mode = PpuMode::Oam2;
-                        }
-                        self.update_ly_and_lyc(&mut events); // ✅ after mode transition
-                    }
-                    PpuMode::VBlank1 => {
-                        self.ly = self.ly.wrapping_add(1);
-                        self.update_ly_and_lyc(&mut events);
-                        if self.ly == 154 {
+                            // WY latch for the new line: window enabled AND WY == current LY
+                            self.wy_latched_this_line =
+                                (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+                            self.set_stat_mode(PpuMode::Oam2, &mut events);
+                            self.update_ly_and_lyc(&mut events);
+                        } else if self.ly > 153 {
+                            // Wrap to LY=0 and begin new frame
                             self.ly = 0;
-                            self.begin_frame();
-                            self.set_stat_mode(PpuMode::Oam2, &mut events);
+                            self.window_line_counter = 0;
                             self.mode = PpuMode::Oam2;
+                            self.wy_latched_this_line =
+                                (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+                            self.set_stat_mode(PpuMode::Oam2, &mut events);
                             self.update_ly_and_lyc(&mut events);
                         }
                     }
                 }
+
+                PpuMode::VBlank1 => {
+                    self.dot_in_mode = self.dot_in_mode.saturating_add(1);
+                    if self.dot_in_mode >= LINE_DOTS {
+                        self.dot_in_mode = 0;
+                        self.ly = self.ly.wrapping_add(1);
+                        if self.ly > 153 {
+                            // Leave VBlank -> begin new frame at LY=0
+                            self.ly = 0;
+                            self.window_line_counter = 0;
+                            self.mode = PpuMode::Oam2;
+                            self.wy_latched_this_line =
+                                (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+                            self.set_stat_mode(PpuMode::Oam2, &mut events);
+                            self.update_ly_and_lyc(&mut events);
+                        } else {
+                            // Stay in VBlank
+                            self.update_ly_and_lyc(&mut events);
+                        }
+                    }
+                }
+
+                PpuMode::Oam2 => {
+                    self.dot_in_mode = self.dot_in_mode.saturating_add(1);
+                    if self.dot_in_mode >= MODE2_OAM {
+                        // Enter Mode 3 exactly once per visible line
+                        self.dot_in_mode = 0;
+                        self.mode = PpuMode::Xfer3;
+
+                        // WX latch for this line at Mode 3 start
+                        self.wx_latched_for_line = self.wx;
+                        self.set_stat_mode(PpuMode::Xfer3, &mut events);
+
+                        // Count sprites overlapping this line
+                        self.sprites_on_line_count = self.count_sprites_on_line();
+
+                        // Render the line
+                        let ly = self.ly;
+                        let mut line = [0u8; LCD_WIDTH];
+                        self.render_scanline(ly, &mut line);
+                        self.render_scanline_objs(ly, &mut line);
+                        self.overlay_debug_scanline(ly, &mut line);
+                        self.framebuf[ly as usize] = line;
+                    }
+                }
+
+                PpuMode::Xfer3 => {
+                    self.dot_in_mode = self.dot_in_mode.saturating_add(1);
+                    // Fixed DMG length for determinism
+                    if self.dot_in_mode >= self.compute_mode3_length() {
+                        self.dot_in_mode = 0;
+                        self.mode = PpuMode::HBlank0;
+                        self.set_stat_mode(PpuMode::HBlank0, &mut events);
+                    }
+                }
             }
+
+            // STAT rising-edge check once per dot
+            // (This call considers LYC, Mode sources as of *current* state)
+            self.maybe_raise_stat_irq(&mut events);
         }
 
         events
     }
 
-    // --- STAT/LY helpers (reuse your existing semantics) -----------------
+    fn step_oam_dma<D: DmaRead>(&mut self, dma: &mut D) {
+        if !self.dma_active {
+            return;
+        }
+        if self.dma_mcycles_left == 0 {
+            self.dma_active = false;
+            return;
+        }
 
-    #[inline]
-    fn set_stat_mode(&mut self, mode: PpuMode, events: &mut GpuEvents) {
-        // write STAT mode bits
-        self.stat = (self.stat & !0x03) | mode.stat_bits();
+        self.dma_mcycles_left -= 1;
 
-        // If entering 0/1/2 and corresponding STAT enable bit is set, request LCD_STAT
-        // (STAT bits: 3:HBlank int enable, 4:VBlank int enable, 5:OAM int enable, 6:LYC)
-        let enabled = match mode {
-            PpuMode::HBlank0 => (self.stat & (1 << 3)) != 0,
-            PpuMode::VBlank1 => (self.stat & (1 << 4)) != 0,
-            PpuMode::Oam2 => (self.stat & (1 << 5)) != 0,
-            PpuMode::Xfer3 => false,
-        };
-        if enabled {
-            events.if_set |= IfBits::LCD_STAT;
+        if self.dma_byte_idx < 160 {
+            let src = ((self.dma_src_high as u16) << 8) | self.dma_byte_idx;
+            let val = dma.read8(src);
+            let dst_index = self.dma_byte_idx as usize;
+            if dst_index < self.oam.len() {
+                self.oam[dst_index] = val;
+            }
+            self.dma_byte_idx += 1;
+        }
+
+        if self.dma_byte_idx >= 160 {
+            self.dma_active = false;
         }
     }
 
+    // ------ helpers ------
+    fn count_sprites_on_line(&self) -> u8 {
+        let sprite_h = if (self.lcdc & 0x04) != 0 { 16 } else { 8 };
+        let mut count = 0u8;
+        let ly_i = self.ly as i16;
+        for i in 0..40 {
+            let base = i * 4;
+            let y = (self.oam[base] as i16) - 16;
+            if ly_i >= y && ly_i < y + sprite_h {
+                count += 1;
+                if count == 10 {
+                    break;
+                }
+            }
+        }
+        count
+    }
+
     #[inline]
-    fn update_ly_and_lyc(&mut self, events: &mut GpuEvents) {
-        // LYC coincidence (STAT bit 2 reflects equality; bit 6 is enable)
-        let equal = self.ly == self.lyc;
-        if equal {
+    fn set_stat_mode(&mut self, mode: PpuMode, _events: &mut GpuEvents) {
+        self.stat = (self.stat & !0x03) | mode.stat_bits();
+        // No immediate IF; we’ll check rising-edge in maybe_raise_stat_irq()
+    }
+
+    #[inline]
+    fn update_ly_and_lyc(&mut self, _events: &mut GpuEvents) {
+        if self.ly == self.lyc {
             self.stat |= 1 << 2;
         } else {
             self.stat &= !(1 << 2);
         }
-        if equal && (self.stat & (1 << 6)) != 0 {
-            events.if_set |= IfBits::LCD_STAT;
-        }
-        // (Your MMU should read FF44 from GPU.ly, and FF41 from GPU.stat.)
+        // Rising-edge from LYC enable is handled in maybe_raise_stat_irq(),
+        // which runs once per dot.
     }
 
-    // ---------------------------
-    // Addressing helpers
-    // ---------------------------
-
-    /// Convert absolute address (0x8000..=0x9FFF) to VRAM index.
+    // -------- VRAM helpers --------
     #[inline]
     fn vram_index(abs: u16) -> Option<usize> {
         if abs < VRAM_BEGIN || abs > VRAM_END { None } else { Some((abs - VRAM_BEGIN) as usize) }
     }
 
-    /// Safe read from VRAM by absolute address. Returns 0 if out of range.
     #[inline]
     pub fn read_vram_abs(&self, abs_addr: u16) -> u8 {
         Self::vram_index(abs_addr)
@@ -451,42 +554,30 @@ impl GPU {
             .unwrap_or(0)
     }
 
-    /// Safe write to VRAM by absolute address. Ignores out-of-range writes.
-    /// Also updates the decoded tile cache when writing within tile pattern region.
     pub fn write_vram_abs(&mut self, abs_addr: u16, value: u8) {
         if let Some(ix) = Self::vram_index(abs_addr) {
             self.write_vram(ix, value);
         }
     }
 
-    // ---------------------------
-    // Index-based access (internal/core)
-    // ---------------------------
-
-    /// Read VRAM by (already-offset) index [0..VRAM_SIZE). Returns 0 if OOB.
     #[inline]
     pub fn read_vram(&self, index: usize) -> u8 {
         self.vram.get(index).copied().unwrap_or(0)
     }
 
-    /// Write VRAM by index [0..VRAM_SIZE). No-ops if OOB.
-    /// If within tile pattern data region (first 0x1800 bytes),
-    /// decodes that tile row into the tile cache.
     pub fn write_vram(&mut self, index: usize, value: u8) {
         if index >= VRAM_SIZE {
             return;
         }
         self.vram[index] = value;
 
-        // Only update tile data region
         if index >= TILE_DATA_LEN {
             return;
         }
 
-        let norm = index & !1; // always start at even byte
+        let norm = index & !1;
         let b0 = self.vram[norm];
         let b1 = self.vram[norm + 1];
-
         let tile_index = norm / 16;
         let row_index = (norm % 16) / 2;
 
@@ -495,160 +586,121 @@ impl GPU {
         }
     }
 
-    // ---------------------------
-    // Tile cache API
-    // ---------------------------
-
+    // -------- tile cache ----------
     #[inline]
     pub fn get_tile(&self, index: usize) -> Option<&Tile> {
         self.tile_set.get(index)
     }
-
     #[inline]
     pub fn get_tile_mut(&mut self, index: usize) -> Option<&mut Tile> {
         self.tile_set.get_mut(index)
     }
 
-    // ---------------------------
-    // BG/Window scanline rendering (DMG)
-    // ---------------------------
-
-    /// Render the background/window for scanline `ly` into `out[0..160]`.
-    /// Output values are DMG shade indices 0..3 after BGP mapping
-    /// (0 = white, 3 = black in typical palette).
-    ///
-    /// This does NOT draw sprites (OBJ).
+    // -------- BG/Window ----------
     pub fn render_scanline(&mut self, ly: u8, out: &mut [u8; LCD_WIDTH]) {
-        // LCDC gates
         let lcd_on = (self.lcdc & 0x80) != 0;
         let bg_on = (self.lcdc & 0x01) != 0;
-        let win_on = (self.lcdc & 0x20) != 0; // (unused here, just showing context)
+        let win_on = (self.lcdc & 0x20) != 0;
+
+        // Latches: WY in Mode 2; WX at Mode 3 start.
+        let win_left_latched = self.wx_latched_for_line.wrapping_sub(7);
+        let window_vert_active = win_on && self.wy_latched_this_line;
+
         let use_8000 = (self.lcdc & 0x10) != 0;
 
         if !lcd_on || !bg_on {
-            // Fill with BG color 0 and mark BG indices as 0 for OBJ priority.
             let c0 = self.map_bgp(TilePixelValue::Zero);
             out.fill(c0);
-            self.bg_idx_line.fill(0); // <-- IMPORTANT: clear raw BG indices
+            self.bg_idx_line.fill(0);
             return;
         }
 
-        // Select tilemap base addresses (absolute)
+        // Tilemap bases (LCDC.3, LCDC.6)
         let bg_map_base_abs: u16 = if (self.lcdc & 0x08) != 0 { 0x9c00 } else { 0x9800 };
         let win_map_base_abs: u16 = if (self.lcdc & 0x40) != 0 { 0x9c00 } else { 0x9800 };
-
-        // Precompute VRAM indices for tile maps
         let bg_map_base = Self::vram_index(bg_map_base_abs).unwrap_or(0);
         let win_map_base = Self::vram_index(win_map_base_abs).unwrap_or(0);
 
-        // Fine Y within the 256-line BG space and per-window
-        let bg_y = ly.wrapping_add(self.scy); // wrap at 256
+        // BG scrolled Y for this line; compute coarse/fine indices.
+        let bg_y = ly.wrapping_add(self.scy);
         let bg_tile_row = ((bg_y as usize) / 8) % 32;
         let bg_fine_y = (bg_y as usize) & 7;
 
-        // Window left x with WX-7 quirk
-        let win_left = self.wx.wrapping_sub(7);
-
-        // Determine if window is vertically active THIS scanline
-        // per Pan Docs: Window visible if ly >= WY and LCDC.5 set
-        let window_vert_active = win_on && ly >= self.wy;
-
-        // Track if window contributed any pixel on this line
         let mut window_used_this_line = false;
 
-        // Render pixels
         for x in 0..LCD_WIDTH {
-            let window_active_here = window_vert_active && (x as u8) >= win_left;
-
+            let window_active_here = window_vert_active && (x as u8) >= win_left_latched;
             if window_active_here {
                 window_used_this_line = true;
             }
 
             let (map_base, tile_col, fine_x, tile_row, fine_y) = if window_active_here {
-                // Use the persistent window internal counter (DMG-accurate)
                 let wy_internal = self.window_line_counter as usize;
-                let wx0 = (x as u8).wrapping_sub(win_left) as usize;
-
+                let wx0 = (x as u8).wrapping_sub(win_left_latched) as usize;
                 let tile_col = (wx0 / 8) % 32;
                 let tile_row = (wy_internal / 8) % 32;
                 let fine_x = wx0 & 7;
                 let fine_y = wy_internal & 7;
-
                 (win_map_base, tile_col, fine_x, tile_row, fine_y)
             } else {
-                // Background with scrolling
                 let bg_x = (x as u8).wrapping_add(self.scx);
                 let tile_col = ((bg_x as usize) / 8) % 32;
                 let fine_x = (bg_x as usize) & 7;
-
                 (bg_map_base, tile_col, fine_x, bg_tile_row, bg_fine_y)
             };
 
-            // Fetch tile id from the map (32x32 = 1024 bytes)
             let map_off = tile_row * 32 + tile_col;
-            let tile_id = self.vram[map_base + map_off]; // assumes valid map_base + 0..1023
-
-            // Resolve tile index into the tile_set based on LCDC bit4
+            let tile_id = self.vram[map_base + map_off];
 
             let tile_index: usize = if use_8000 {
-                // Unsigned index, 0..255 -> tiles 0..255
                 tile_id as usize
             } else {
-                // Signed index, base at 0x9000 => tile #0 at 0x9000 = tile index 256
-                let n = tile_id as i8 as i16;
-                (256i16 + n) as usize // range 128..383
+                let n = tile_id as i8 as i16; // [-128,127]
+                (256i16 + n) as usize // -> 128..383
             };
 
-            debug_assert!(tile_index < TILE_COUNT);
-
-            // Read pixel color from tile cache (defensive bounds)
             let px = if tile_index < TILE_COUNT {
                 self.tile_set[tile_index][fine_y][fine_x]
             } else {
                 TilePixelValue::Zero
             };
 
-            // Record BG raw color index (0..3) for OBJ priority decisions.
-            let bg_idx = match px {
+            self.bg_idx_line[x] = match px {
                 TilePixelValue::Zero => 0,
                 TilePixelValue::One => 1,
                 TilePixelValue::Two => 2,
                 TilePixelValue::Three => 3,
             };
-            self.bg_idx_line[x] = bg_idx;
 
-            // Map via BGP palette (DMG) to shade for display
             out[x] = self.map_bgp(px);
         }
 
-        // Increment the window line counter only if the window actually contributed pixels.
         if window_used_this_line {
             self.window_line_counter = self.window_line_counter.wrapping_add(1);
+            #[cfg(feature = "trace_ppu")]
+            eprintln!("[PPU] window drew on ly={}, start_x={}", ly, win_left_latched);
         }
     }
 
-    /// Overlay OBJ (sprites) on top of the already-drawn BG/Window for scanline `ly`.
-    /// `out` holds DMG shades (0..3). Uses `bg_idx_line` for OBJ↔BG priority.
-    /// DMG OBJ→OBJ priority: smaller X in front; ties -> lower OAM index.  [Pan Docs / gbdev]
+    // -------- Sprites (OBJ) ----------
     pub fn render_scanline_objs(&self, ly: u8, out: &mut [u8; LCD_WIDTH]) {
-        // OBJ rendering enabled only if LCD is on and OBJ enable (LCDC bit1)
         let lcd_on = (self.lcdc & 0x80) != 0;
         let obj_on = (self.lcdc & 0x02) != 0;
         if !lcd_on || !obj_on {
             return;
         }
 
-        let obj_8x16 = (self.lcdc & 0x04) != 0; // LCDC bit2
+        let obj_8x16 = (self.lcdc & 0x04) != 0;
         let obj_h = if obj_8x16 { 16 } else { 8 };
 
-        // 1) Select up to 10 sprites that intersect this scanline, in OAM order.
+        // 1) Select up to 10 sprites by Y overlap, in OAM order
         let mut selected: [usize; 10] = [usize::MAX; 10];
         let mut count = 0usize;
+        let ly_i16 = ly as i16;
+
         for i in 0..40 {
             let base = i * 4;
-            let oam_y = self.oam[base] as i16;
-            let y = oam_y - 16; // on-screen Y
-            let ly_i16 = ly as i16;
+            let y = (self.oam[base] as i16) - 16;
             if ly_i16 >= y && ly_i16 < y + obj_h {
                 selected[count] = i;
                 count += 1;
@@ -661,35 +713,35 @@ impl GPU {
             return;
         }
 
-        // 2) DMG OBJ→OBJ priority among the selected set:
-        //    smaller X wins (front), tie -> lower OAM index.
-        //    We'll sort by (x asc, idx asc), then draw in reverse (back-to-front),
-        //    so that the "frontmost" sprite is drawn last.
+        // 2) OBJ→OBJ priority: smaller X first; ties -> lower OAM index
         let mut order: [(usize, i16); 10] = [(usize::MAX, 0); 10];
         for si in 0..count {
             let i = selected[si];
             let base = i * 4;
-            let oam_x = self.oam[base + 1] as i16;
-            let x = oam_x - 8; // on-screen X (can be <0 or >=160 but still participates in priority)
+            let x = (self.oam[base + 1] as i16) - 8;
             order[si] = (i, x);
         }
-        // Simple selection sort over the first `count` entries
-        for a in 0..count {
-            let mut min = a;
-            for b in a + 1..count {
-                let (i_b, x_b) = order[b];
-                let (i_m, x_m) = order[min];
-                if x_b < x_m || (x_b == x_m && i_b < i_m) {
-                    min = b;
+        for a in 1..count {
+            let key = order[a];
+            let mut j = a;
+            while j > 0 {
+                let (ij, xj) = order[j - 1];
+                let (ik, xk) = key;
+                if xj < xk || (xj == xk && ij < ik) {
+                    break;
                 }
+                order[j] = order[j - 1];
+                j -= 1;
             }
-            if min != a {
-                order.swap(a, min);
-            }
+            order[j] = key;
         }
 
-        // 3) Draw in reverse sorted order (back-to-front).
-        for si in (0..count).rev() {
+        // 3) Pick first non-zero OBJ pixel per x, then apply BG-over-OBJ
+        let mut cand_idx: [u8; LCD_WIDTH] = [0; LCD_WIDTH];
+        let mut cand_obp1: [bool; LCD_WIDTH] = [false; LCD_WIDTH];
+        let mut cand_bgbit: [bool; LCD_WIDTH] = [false; LCD_WIDTH];
+
+        for si in 0..count {
             let (i, _) = order[si];
             let base = i * 4;
             let oam_y = self.oam[base] as i16;
@@ -700,20 +752,16 @@ impl GPU {
             let y = oam_y - 16;
             let x = oam_x - 8;
 
-            let behind_bg = (attr & 0x80) != 0; // bit7
-            let yflip = (attr & 0x40) != 0; // bit6
-            let xflip = (attr & 0x20) != 0; // bit5
-            let use_obp1 = (attr & 0x10) != 0; // bit4
+            let behind_bg = (attr & 0x80) != 0;
+            let yflip = (attr & 0x40) != 0;
+            let xflip = (attr & 0x20) != 0;
+            let use_obp1 = (attr & 0x10) != 0;
 
-            // Line inside the sprite
             let mut line = (ly as i16) - y;
             if yflip {
                 line = obj_h - 1 - line;
             }
 
-            // Resolve tile index and row within the tile cache.
-            // DMG OBJ always uses 0x8000 tile data (unsigned indices 0..255).
-            // In 8x16, the base tile is even; lines >= 8 use the next tile.
             let (tile_index, row_in_tile) = if obj_8x16 {
                 let base_even = (tile & 0xfe) as usize;
                 if line >= 8 {
@@ -725,20 +773,20 @@ impl GPU {
                 (tile as usize, line as usize)
             };
 
-            // Defensive bounds
             if tile_index >= TILE_COUNT || row_in_tile >= 8 {
                 continue;
             }
 
-            // For each pixel in the tile row
             for px in 0..8 {
-                let screen_x = x + ((if xflip { 7 - px } else { px }) as i16);
-                if screen_x < 0 || screen_x >= (LCD_WIDTH as i16) {
+                let sx_i16 = x + ((if xflip { 7 - px } else { px }) as i16);
+                if sx_i16 < 0 || sx_i16 >= (LCD_WIDTH as i16) {
                     continue;
                 }
-                let sx = screen_x as usize;
+                let sx = sx_i16 as usize;
+                if cand_idx[sx] != 0 {
+                    continue;
+                }
 
-                // OBJ pixel (0..3), 0 is transparent
                 let obj_px = self.tile_set[tile_index][row_in_tile][px as usize];
                 let obj_idx = match obj_px {
                     TilePixelValue::Zero => 0,
@@ -747,30 +795,28 @@ impl GPU {
                     TilePixelValue::Three => 3,
                 };
                 if obj_idx == 0 {
-                    continue; // transparent
-                }
-
-                // BG↔OBJ priority: if behind_bg=1, sprite is behind BG unless BG color index is 0.
-                if behind_bg && self.bg_idx_line[sx] != 0 {
                     continue;
                 }
 
-                // Map through OBP0/OBP1 (DMG)
-                let shade = self.map_obp(obj_idx, use_obp1);
-                out[sx] = shade;
+                cand_idx[sx] = obj_idx;
+                cand_obp1[sx] = use_obp1;
+                cand_bgbit[sx] = behind_bg;
             }
+        }
+
+        for x in 0..LCD_WIDTH {
+            let idx = cand_idx[x];
+            if idx == 0 {
+                continue;
+            }
+            if cand_bgbit[x] && self.bg_idx_line[x] != 0 {
+                continue;
+            }
+            out[x] = self.map_obp(idx, cand_obp1[x]);
         }
     }
 
-    // ---------------------------
-    // Decode helpers
-    // ---------------------------
-
-    /// Decode one tile row from the two bitplanes (low=b0, high=b1):
-    /// For pixel k (0..7):
-    ///   bit = 7 - k
-    ///   color_id = ((b1>>bit)&1)<<1 | ((b0>>bit)&1)
-    ///   map 0..3 -> Zero..Three
+    // -------- decode helpers --------
     #[inline]
     fn decode_tile_row(b0: u8, b1: u8) -> [TilePixelValue; 8] {
         let mut row = [TilePixelValue::Zero; 8];
@@ -789,9 +835,6 @@ impl GPU {
         row
     }
 
-    /// DMG BG palette mapping (BGP, FF47).
-    /// BGP bits: [7:6]=color3, [5:4]=color2, [3:2]=color1, [1:0]=color0.
-    /// Returns shade index 0..3 (0=white, 3=black in typical DMG palette).
     #[inline]
     fn map_bgp(&self, px: TilePixelValue) -> u8 {
         let idx = match px {
@@ -803,23 +846,17 @@ impl GPU {
         (self.bgp >> (idx * 2)) & 0b11
     }
 
-    /// DMG OBJ palette mapping (OBP0/OBP1).
-    /// Same bit packing as BGP. OBJ color index 0 is transparent by rule.
     #[inline]
     fn map_obp(&self, px_idx: u8, use_obp1: bool) -> u8 {
         let pal = if use_obp1 { self.obp1 } else { self.obp0 };
         (pal >> (px_idx * 2)) & 0b11
     }
 
-    // ---------------------------
-    // Debug overlay configuration
-    // ---------------------------
-    /// Replace the current debug overlay configuration.
+    // -------- debug overlay --------
     pub fn set_debug_config(&mut self, cfg: DebugOverlayConfig) {
         fn clamp2(x: u8) -> u8 {
             x.min(3)
         }
-
         self.debug = DebugOverlayConfig {
             show_bg_tile_grid: cfg.show_bg_tile_grid,
             show_window_bounds: cfg.show_window_bounds,
@@ -831,16 +868,15 @@ impl GPU {
             shade_sprite_box: clamp2(cfg.shade_sprite_box),
         };
     }
-    /// Borrow the debug configuration for in-place edits.
     #[inline]
     pub fn debug_config_mut(&mut self) -> &mut DebugOverlayConfig {
         &mut self.debug
     }
-    /// Read-only access to the debug configuration.
     #[inline]
     pub fn debug_config(&self) -> &DebugOverlayConfig {
         &self.debug
     }
+
     #[inline]
     fn blend(over: u8, base: u8) -> u8 {
         if over > base { over } else { base }
@@ -853,23 +889,11 @@ impl GPU {
         }
     }
 
-    /// Apply optional debug overlays to the already rendered scanline in `out`.
-    /// Call this after `render_scanline` and `render_scanline_objs` for line `ly`.
-    /// Overlays are drawn using simple blending that prefers darker shades (max of DMG shade indices).
     pub fn overlay_debug_scanline(&self, ly: u8, out: &mut [u8; LCD_WIDTH]) {
-        // Early exit if nothing enabled
-        if
-            !(
-                self.debug.show_bg_tile_grid ||
-                self.debug.show_window_bounds ||
-                self.debug.show_bg_axes ||
-                self.debug.show_sprite_boxes
-            )
-        {
+        if !self.debug.any_enabled() {
             return;
         }
 
-        // 1) BG tile grid (every 8 px), accounts for SCX/SCY
         if self.debug.show_bg_tile_grid {
             let shade = self.debug.shade_grid & 0b11;
             for x in 0..LCD_WIDTH as i32 {
@@ -877,7 +901,6 @@ impl GPU {
                     Self::put_pixel_safe(out, x, shade);
                 }
             }
-            // horizontal line
             if (((self.scy as i32) + (ly as i32)) & 7) == 0 {
                 for x in 0..LCD_WIDTH as i32 {
                     Self::put_pixel_safe(out, x, shade);
@@ -885,26 +908,22 @@ impl GPU {
             }
         }
 
-        // 2) Window bounds (top + left), WX-7 quirk
         if self.debug.show_window_bounds {
             let win_on = (self.lcdc & 0x20) != 0;
             if win_on {
                 let win_left = self.wx.wrapping_sub(7) as i32;
                 let wy = self.wy as i32;
                 if (ly as i32) == wy {
-                    // top border
                     for x in 0..LCD_WIDTH as i32 {
                         Self::put_pixel_safe(out, x, self.debug.shade_window & 0b11);
                     }
                 }
-                // left border
                 if (0..LCD_WIDTH as i32).contains(&win_left) {
                     Self::put_pixel_safe(out, win_left, self.debug.shade_window & 0b11);
                 }
             }
         }
 
-        // 3) BG origin axes
         if self.debug.show_bg_axes {
             let shade = self.debug.shade_axes & 0b11;
             if (0..LCD_WIDTH as i32).contains(&(0 - (self.scx as i32))) {
@@ -917,7 +936,6 @@ impl GPU {
             }
         }
 
-        // 4) Sprite boxes (draw 8x8/8x16 rectangles for all 40 sprites)
         if self.debug.show_sprite_boxes {
             let shade = self.debug.shade_sprite_box & 0b11;
             for i in 0..40 {
@@ -928,20 +946,26 @@ impl GPU {
                 let h = if obj_8x16 { 16 } else { 8 };
                 let line = ly as i32;
                 if line >= sprite_y && line < sprite_y + h {
-                    // draw horizontal line of box
                     for px in 0..8 {
                         Self::put_pixel_safe(out, sprite_x + px, shade);
                     }
-                    // draw vertical edges
                     Self::put_pixel_safe(out, sprite_x, shade);
                     Self::put_pixel_safe(out, sprite_x + 7, shade);
-                    if obj_8x16 {
-                        // draw extra vertical for 16px sprite
-                        Self::put_pixel_safe(out, sprite_x + 0, shade);
-                        Self::put_pixel_safe(out, sprite_x + 7, shade);
-                    }
                 }
             }
         }
+    }
+
+    // --------------- OAM DMA public API (FF46) ----------------
+    pub fn write_ff46_start_dma(&mut self, v: u8) {
+        self.dma_active = true;
+        self.dma_src_high = v;
+        self.dma_byte_idx = 0;
+        self.dma_mcycles_left = 160; // 160 M-cycles (normal speed)
+    }
+
+    #[inline]
+    pub fn dma_in_progress(&self) -> bool {
+        self.dma_active
     }
 }
