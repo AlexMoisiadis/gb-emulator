@@ -1,6 +1,8 @@
 // src/mmu.rs
 use crate::gpu::GPU;
 use crate::timer::Timer;
+use crate::cart::Cartridge;
+use crate::input::joypad::Joypad;
 
 // VRAM and OAM windows (DMG)
 const VRAM_BEGIN: u16 = 0x8000;
@@ -18,6 +20,8 @@ const IO_OBP1: u16 = 0xff49;
 const IO_WY: u16 = 0xff4a;
 const IO_WX: u16 = 0xff4b;
 
+pub const IO_JOYPAD: u16 = 0xff00;
+
 // STAT/LY/LYC
 const IO_STAT: u16 = 0xff41;
 const IO_LY: u16 = 0xff44;
@@ -34,6 +38,7 @@ pub struct MMU {
     memory: Box<[u8; 0x10000]>,
     boot_rom: Option<Vec<u8>>,
     boot_enabled: bool,
+    cart: Cartridge,
 }
 
 impl MMU {
@@ -42,6 +47,8 @@ impl MMU {
             memory: Box::new([0u8; 0x10000]),
             boot_rom: None,
             boot_enabled: false,
+            cart: Cartridge::new(),
+            joypad: joypad::new(),
         }
     }
 
@@ -77,6 +84,9 @@ impl MMU {
         }
 
         match addr {
+            0x0000..=0x7fff => self.cart.read_rom(addr),
+            0xa000..=0xbfff => self.cart.read_ram(addr),
+
             VRAM_BEGIN..=VRAM_END => {
                 let ix = (addr - VRAM_BEGIN) as usize;
                 gpu.read_vram(ix)
@@ -114,6 +124,8 @@ impl MMU {
 
         match addr {
             0x0000..=0x7fff => {/* no-MBC: ignore mapper writes for now */}
+
+            IO_JOYPAD => self.joypad.write(value),
 
             VRAM_BEGIN..=VRAM_END => {
                 gpu.write_vram_abs(addr, value);

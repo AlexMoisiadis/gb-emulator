@@ -6,6 +6,8 @@ pub mod registers;
 pub mod timer;
 pub mod types;
 pub mod mmu;
+pub mod cart;
+pub mod input;
 
 pub use bus::MemoryBus;
 pub use cpu::CPU;
@@ -15,3 +17,5 @@ pub use instruction::{ DecodeError, Instruction };
 pub use registers::{ FlagsRegister, Registers };
 pub use timer::Timer;
 pub use types::{ ArithmeticTarget, JumpTest };
+pub use cart::Cartridge;
+pub use input::joypad::Joypad;

@@ -2,17 +2,19 @@
 use crate::gpu::{ GPU, GpuEvents, DebugOverlayConfig, DmaRead };
 use crate::timer::Timer;
 use crate::mmu::MMU;
+use crate::cart::Cartridge;
 
 /// System memory bus tying MMU, GPU and Timer.
 pub struct MemoryBus {
     pub mmu: MMU,
     pub gpu: GPU,
     timer: Timer,
+    cart: Cartridge,
 }
 
 impl MemoryBus {
     pub fn new() -> Self {
-        Self { mmu: MMU::new(), gpu: GPU::new(), timer: Timer::new() }
+        Self { mmu: MMU::new(), gpu: GPU::new(), timer: Timer::new(), cart: Cartridge }
     }
 
     #[inline]
