@@ -9,6 +9,7 @@ pub mod mmu;
 pub mod cart;
 pub mod input;
 pub mod trace;
+pub mod apu;
 
 pub use bus::MemoryBus;
 pub use cpu::CPU;
@@ -20,3 +21,4 @@ pub use timer::Timer;
 pub use types::{ ArithmeticTarget, JumpTest };
 pub use cart::Cartridge;
 pub use input::joypad::Joypad;
+// pub use sound::ch1::APU;

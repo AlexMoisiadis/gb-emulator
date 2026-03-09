@@ -10,9 +10,10 @@ pixels = "0.15"
 winit  = { version = "0.30", features = ["rwh_05"] }
 png = "0.17"
 bitflags = "2.11.0"
+cpal = "0.17.3"
+ringbuf = "0.4.8"
 
 # Optional now; add later when you wire audio
-# cpal   = "0.15"
 # gilrs  = "0.10"       # gamepads
 
 [features]

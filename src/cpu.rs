@@ -496,6 +496,7 @@ impl CPU {
         // 2) Advance PPU by the same amount and surface its events into IF now
         bus.service_gpu(total_tcycles);
         bus.service_timer(total_tcycles);
+        bus.service_apu(total_tcycles);
         bus.service_input();
 
         // 3) Apply the deferred IME enable (EI delay completes *after* this instr)
@@ -553,6 +554,7 @@ impl CPU {
                 total_tcycles = total_tcycles.saturating_add(20);
                 bus.service_gpu(20);
                 bus.service_timer(20);
+                bus.service_apu(20);
                 bus.service_input();
             }
         } else if self.halted && pending_now != 0 {

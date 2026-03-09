@@ -3,6 +3,7 @@ use crate::gpu::GPU;
 use crate::timer::Timer;
 use crate::cart::Cartridge;
 use crate::input::joypad::Joypad;
+use crate::apu::Apu;
 #[cfg(feature = "trace_ppu")]
 use crate::trace::{ self, Category as TraceCategory };
 
@@ -110,7 +111,14 @@ impl MMU {
     }
 
     #[inline]
-    fn read8_impl(&self, addr: u16, gpu: &GPU, timer: &Timer, cpu_bus_rules: bool) -> u8 {
+    fn read8_impl(
+        &self,
+        addr: u16,
+        gpu: &GPU,
+        timer: &Timer,
+        apu: &Apu,
+        cpu_bus_rules: bool
+    ) -> u8 {
         // DMG bus gating during OAM DMA: CPU can only access HRAM ($FF80..$FFFE)
         if cpu_bus_rules && gpu.dma_in_progress() && !(0xff80..=0xfffe).contains(&addr) {
             return 0xff;
@@ -152,6 +160,8 @@ impl MMU {
 
             0xff04..=0xff07 => timer.read_io(addr),
 
+            0xff10..=0xff3f => apu.read(addr),
+
             _ => {
                 // Unmapped I/O regions read as 0xFF on DMG
                 match addr {
@@ -168,17 +178,24 @@ impl MMU {
     }
 
     /// CPU read; forwards to GPU/Timer or flat memory.
-    pub fn read8(&self, addr: u16, gpu: &GPU, timer: &Timer) -> u8 {
-        self.read8_impl(addr, gpu, timer, true)
+    pub fn read8(&self, addr: u16, gpu: &GPU, timer: &Timer, apu: &Apu) -> u8 {
+        self.read8_impl(addr, gpu, timer, apu, true)
     }
 
     /// Internal DMA read path: bypasses CPU bus gating rules.
-    pub fn read8_dma(&self, addr: u16, gpu: &GPU, timer: &Timer) -> u8 {
-        self.read8_impl(addr, gpu, timer, false)
+    pub fn read8_dma(&self, addr: u16, gpu: &GPU, timer: &Timer, apu: &Apu) -> u8 {
+        self.read8_impl(addr, gpu, timer, apu, false)
     }
 
     /// CPU write; forwards to GPU/Timer or flat memory.
-    pub fn write8(&mut self, addr: u16, value: u8, gpu: &mut GPU, timer: &mut Timer) {
+    pub fn write8(
+        &mut self,
+        addr: u16,
+        value: u8,
+        gpu: &mut GPU,
+        timer: &mut Timer,
+        apu: &mut Apu
+    ) {
         // DMG bus gating during OAM DMA: CPU writes outside HRAM are ignored
         if gpu.dma_in_progress() && !(0xff80..=0xfffe).contains(&addr) {
             return;
@@ -353,6 +370,8 @@ impl MMU {
             }
 
             0xff04..=0xff07 => timer.write_io(addr, value),
+
+            0xff10..=0xff3f => apu.write(addr, value),
 
             _ => {
                 self.memory[addr as usize] = value;

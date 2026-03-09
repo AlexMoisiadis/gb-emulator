@@ -1,7 +1,10 @@
 // src/bus.rs
 use crate::gpu::{ GPU, GpuEvents, DebugOverlayConfig, DmaRead };
+use crate::apu::output::AudioOutput;
 use crate::timer::Timer;
+use crate::apu::Apu;
 use crate::mmu::MMU;
+use ringbuf::traits::Producer;
 #[cfg(feature = "trace_ppu")]
 use crate::trace::{ self, Category as TraceCategory };
 
@@ -32,11 +35,26 @@ pub struct MemoryBus {
     pub mmu: MMU,
     pub gpu: GPU,
     timer: Timer,
+    pub apu: Apu,
+    audio: Option<AudioOutput>,
 }
 
 impl MemoryBus {
     pub fn new() -> Self {
-        Self { mmu: MMU::new(), gpu: GPU::new(), timer: Timer::new() }
+        let audio = AudioOutput::new()
+            .map_err(|e| eprintln!("[APU] audio init failed: {e}"))
+            .ok();
+        let sample_rate = audio
+            .as_ref()
+            .map(|a| a.sample_rate)
+            .unwrap_or(44100.0);
+        Self {
+            mmu: MMU::new(),
+            gpu: GPU::new(),
+            timer: Timer::new(),
+            apu: Apu::new(sample_rate),
+            audio,
+        }
     }
 
     #[inline]
@@ -46,6 +64,17 @@ impl MemoryBus {
         let mut dma = DmaProxy { bus: bus_ptr };
         let events: GpuEvents = self.gpu.tick(tcycles, &mut dma);
         self.apply_gpu_events(events);
+    }
+
+    #[inline]
+    // In service loop (alongside service_gpu / service_timer):
+    pub fn service_apu(&mut self, tcycles: u32) {
+        self.apu.tick(tcycles);
+        if let Some(audio) = &mut self.audio {
+            for sample in self.apu.sample_buffer.drain(..) {
+                let _ = audio.producer.try_push(sample);
+            }
+        }
     }
 
     pub fn apply_gpu_events(&mut self, events: GpuEvents) {
@@ -150,12 +179,12 @@ impl MemoryBus {
 
     #[inline]
     pub fn read_byte(&self, address: u16) -> u8 {
-        self.mmu.read8(address, &self.gpu, &self.timer)
+        self.mmu.read8(address, &self.gpu, &self.timer, &self.apu)
     }
 
     #[inline]
     pub fn write_byte(&mut self, address: u16, value: u8) {
-        self.mmu.write8(address, value, &mut self.gpu, &mut self.timer);
+        self.mmu.write8(address, value, &mut self.gpu, &mut self.timer, &mut self.apu);
     }
 }
 
@@ -170,10 +199,8 @@ struct DmaProxy {
 impl DmaRead for DmaProxy {
     #[inline]
     fn read8(&mut self, addr: u16) -> u8 {
-        // SAFETY: Read-only snapshot of sub-components while GPU holds &mut self.
-        // MMU::read8 takes &self and &GPU/&Timer (both read-only here).
         unsafe {
-            (*self.bus).mmu.read8_dma(addr, &(*self.bus).gpu, &(*self.bus).timer)
+            (*self.bus).mmu.read8_dma(addr, &(*self.bus).gpu, &(*self.bus).timer, &(*self.bus).apu)
         }
     }
 }
