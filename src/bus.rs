@@ -2,19 +2,41 @@
 use crate::gpu::{ GPU, GpuEvents, DebugOverlayConfig, DmaRead };
 use crate::timer::Timer;
 use crate::mmu::MMU;
-use crate::cart::Cartridge;
+#[cfg(feature = "trace_ppu")]
+use crate::trace::{ self, Category as TraceCategory };
+
+#[derive(Debug, Clone, Copy)]
+pub enum InterruptSource {
+    VBlank,
+    LcdStat,
+    Timer,
+    Serial,
+    Joypad,
+}
+
+impl InterruptSource {
+    #[inline]
+    pub fn if_mask(self) -> u8 {
+        match self {
+            InterruptSource::VBlank => 0x01,
+            InterruptSource::LcdStat => 0x02,
+            InterruptSource::Timer => 0x04,
+            InterruptSource::Serial => 0x08,
+            InterruptSource::Joypad => 0x10,
+        }
+    }
+}
 
 /// System memory bus tying MMU, GPU and Timer.
 pub struct MemoryBus {
     pub mmu: MMU,
     pub gpu: GPU,
     timer: Timer,
-    cart: Cartridge,
 }
 
 impl MemoryBus {
     pub fn new() -> Self {
-        Self { mmu: MMU::new(), gpu: GPU::new(), timer: Timer::new(), cart: Cartridge }
+        Self { mmu: MMU::new(), gpu: GPU::new(), timer: Timer::new() }
     }
 
     #[inline]
@@ -27,12 +49,17 @@ impl MemoryBus {
     }
 
     pub fn apply_gpu_events(&mut self, events: GpuEvents) {
-        if !events.if_set.is_empty() {
-            let old_if = self.read_byte(0xff0f);
-            let new_if = old_if | events.if_set.bits();
-            if new_if != old_if {
-                self.write_byte(0xff0f, new_if);
-                #[cfg(feature = "trace_ppu")]
+        let _old_if = self.read_if();
+        if events.if_from_vblank || events.if_set.contains(crate::gpu::IfBits::VBLANK) {
+            self.raise_interrupt(InterruptSource::VBlank);
+        }
+        if events.if_from_stat || events.if_set.contains(crate::gpu::IfBits::LCD_STAT) {
+            self.raise_interrupt(InterruptSource::LcdStat);
+        }
+        #[cfg(feature = "trace_ppu")]
+        {
+            let new_if = self.read_if();
+            if new_if != _old_if && !trace::structured_enabled() {
                 eprintln!(
                     "[BUS] IF now={:02X} IE={:02X} (ly={}, mode={})",
                     new_if,
@@ -45,6 +72,69 @@ impl MemoryBus {
         if events.frame_became_ready {
             // Front-end can observe via gpu.take_frame_ready()
         }
+    }
+
+    // #[inline]
+    // pub fn service_timer(&mut self, tcycles: u32) {
+    //     let mcycles = tcycles / 4;
+    //     if mcycles > 0 && self.timer.tick(mcycles) {
+    //         self.raise_interrupt(InterruptSource::Timer);
+    //     }
+    // }
+
+    pub fn press_button(&mut self, button: crate::input::joypad::Button) {
+        self.mmu.joypad.press(button);
+    }
+    pub fn release_button(&mut self, button: crate::input::joypad::Button) {
+        self.mmu.joypad.release(button);
+    }
+
+    #[inline]
+    pub fn service_timer(&mut self, tcycles: u32) {
+        if tcycles > 0 && self.timer.tick(tcycles) {
+            self.raise_interrupt(InterruptSource::Timer);
+        }
+    }
+
+    #[inline]
+    pub fn service_input(&mut self) {
+        if self.mmu.poll_joypad_irq() {
+            self.raise_interrupt(InterruptSource::Joypad);
+        }
+    }
+
+    #[inline]
+    pub fn raise_interrupt(&mut self, source: InterruptSource) {
+        self.mmu.set_if_bits(source.if_mask());
+        #[cfg(feature = "trace_ppu")]
+        if trace::enabled(TraceCategory::CpuIrq) {
+            let src = match source {
+                InterruptSource::VBlank => "vblank",
+                InterruptSource::LcdStat => "lcd_stat",
+                InterruptSource::Timer => "timer",
+                InterruptSource::Serial => "serial",
+                InterruptSource::Joypad => "joypad",
+            };
+            eprintln!(
+                "event=irq_raise step={} src={} if={:02X} frame={} ly={} mode={}",
+                trace::step(),
+                src,
+                self.read_if(),
+                self.gpu.frame_index(),
+                self.gpu.ly(),
+                self.gpu.mode_code()
+            );
+        }
+    }
+
+    #[inline]
+    pub fn clear_interrupt(&mut self, source: InterruptSource) {
+        self.mmu.clear_if_bits(source.if_mask());
+    }
+
+    #[inline]
+    pub fn read_if(&self) -> u8 {
+        self.mmu.if_reg()
     }
 
     pub fn set_gpu_debug_config(&mut self, cfg: DebugOverlayConfig) {
@@ -83,7 +173,7 @@ impl DmaRead for DmaProxy {
         // SAFETY: Read-only snapshot of sub-components while GPU holds &mut self.
         // MMU::read8 takes &self and &GPU/&Timer (both read-only here).
         unsafe {
-            (*self.bus).mmu.read8(addr, &(*self.bus).gpu, &(*self.bus).timer)
+            (*self.bus).mmu.read8_dma(addr, &(*self.bus).gpu, &(*self.bus).timer)
         }
     }
 }

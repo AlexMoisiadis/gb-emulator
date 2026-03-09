@@ -1,6 +1,7 @@
 // src/bin/viewer.rs
-use gb_emulator::{ CPU, MemoryBus };
 use gb_emulator::gpu::DebugOverlayConfig;
+use gb_emulator::{ CPU, MemoryBus };
+use gb_emulator::input::joypad::Button;
 
 use anyhow::Result;
 use pixels::{ Pixels, SurfaceTexture };
@@ -13,7 +14,7 @@ use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
     event::{ ElementState, KeyEvent, StartCause, WindowEvent },
-    event_loop::EventLoop, // keep ControlFlow path-qualified to avoid warnings
+    event_loop::EventLoop,
     keyboard::{ KeyCode, PhysicalKey },
     window::{ Window, WindowId },
 };
@@ -26,7 +27,7 @@ type Framebuffer = [[u8; W]; H];
 const DMG_DOTS_PER_FRAME: u32 = 70_224;
 const DMG_CLOCK_HZ: u32 = 4_194_304;
 
-// ~16.743 ms (exact ratio w/out fp drift)
+// ~16.743 ms (exact ratio without float drift)
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 const FRAME_NS: u128 = (NANOS_PER_SEC * (DMG_DOTS_PER_FRAME as u128)) / (DMG_CLOCK_HZ as u128);
 const FRAME_DT: Duration = Duration::from_nanos(FRAME_NS as u64);
@@ -41,6 +42,111 @@ fn dmg_shade_to_u8(v: u8) -> u8 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunState {
+    Running,
+    Paused,
+    StepOneFrame,
+    ExitRequested,
+}
+
+#[derive(Debug, Clone)]
+struct ViewerConfig {
+    frame_dt: Duration,
+    max_catchup_frames: u32,
+    pause_on_start: bool,
+    trace_structured: bool,
+    capture_first_n: u32,
+    capture_skip: u32,
+    capture_prefix: String,
+    capture_require_lcd_on: bool,
+}
+
+impl ViewerConfig {
+    fn from_env() -> Self {
+        fn parse_u32(name: &str, default: u32) -> u32 {
+            std::env
+                ::var(name)
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(default)
+        }
+
+        fn parse_bool(name: &str, default: bool) -> bool {
+            match std::env::var(name) {
+                Ok(v) => {
+                    let norm = v.trim().to_ascii_lowercase();
+                    norm == "1" || norm == "true" || norm == "yes" || norm == "on"
+                }
+                Err(_) => default,
+            }
+        }
+
+        let frame_dt = std::env
+            ::var("GB_VIEWER_TARGET_FPS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|fps| *fps > 0.0)
+            .map(|fps| Duration::from_secs_f64(1.0 / fps))
+            .unwrap_or(FRAME_DT);
+
+        Self {
+            frame_dt,
+            max_catchup_frames: parse_u32("GB_VIEWER_MAX_CATCHUP", 3).max(1),
+            pause_on_start: parse_bool("GB_VIEWER_PAUSE_ON_START", false),
+            trace_structured: parse_bool("GB_TRACE_STRUCTURED", false),
+            capture_first_n: parse_u32("GB_CAPTURE_FIRST_N", 10),
+            capture_skip: parse_u32("GB_CAPTURE_SKIP", 8),
+            capture_prefix: std::env
+                ::var("GB_CAPTURE_PREFIX")
+                .unwrap_or_else(|_| "boot-frame".to_string()),
+            capture_require_lcd_on: parse_bool("GB_CAPTURE_REQUIRE_LCD_ON", false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ViewerStats {
+    emulated_frames: u64,
+    presented_frames: u64,
+    dropped_deadlines: u64,
+    catchup_frames: u64,
+    last_emu_time: Duration,
+    last_present_time: Duration,
+}
+
+impl Default for ViewerStats {
+    fn default() -> Self {
+        Self {
+            emulated_frames: 0,
+            presented_frames: 0,
+            dropped_deadlines: 0,
+            catchup_frames: 0,
+            last_emu_time: Duration::ZERO,
+            last_present_time: Duration::ZERO,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingPresent {
+    frame_index: u64,
+    ly_ready: u8,
+    mode_ready: u8,
+    if_reg: u8,
+    emu_time: Duration,
+    catchup_in_cycle: u32,
+}
+
+#[derive(Debug, Clone)]
+enum CaptureDecision {
+    Saved(String),
+    SkippedBeforeWindow,
+    SkippedQuotaReached,
+    SkippedLcdOff,
+    Failed(String),
+}
+
 struct App {
     // Window + surface
     window: Option<Arc<Window>>,
@@ -51,6 +157,14 @@ struct App {
     bus: Box<MemoryBus>,
     fb: Framebuffer,
 
+    // Runtime
+    config: ViewerConfig,
+    run_state: RunState,
+    stats: ViewerStats,
+    next_deadline: Instant,
+    redraw_requested: bool,
+    pending_present: Option<PendingPresent>,
+
     // Overlays
     o_grid: bool,
     o_window: bool,
@@ -60,45 +174,29 @@ struct App {
     // Screenshots
     screenshot_id: u32,
 
-    // Frame cadence & state
-    next_deadline: Instant,
-    needs_present: bool,
-
-    // Guards to prevent re-entrancy
-    in_redraw: bool,
-    in_compute: bool,
-
-    // Capture control
+    // Capture counters
     frame_count: u32,
-    capture_first_n: u32,
     captured_so_far: u32,
-    capture_prefix: String,
-    capture_skip: u32,
 }
 
 impl App {
     fn new(rom_path: String) -> Result<Self> {
+        let config = ViewerConfig::from_env();
+
         let mut cpu = Box::new(CPU::new());
         let mut bus = Box::new(MemoryBus::new());
         post_boot_init(&mut cpu, &mut bus);
 
         // Overlays default; toggle via hotkeys
-        let (o_grid, o_window, o_axes, o_sprites) = (true, true, false, true);
+        let (o_grid, o_window, o_axes, o_sprites) = (false, false, false, false);
 
         // Load ROM
         let rom = std::fs::read(rom_path)?;
         bus.load_rom(&rom);
+        apply_overlay(&mut bus, o_grid, o_window, o_axes, o_sprites);
 
-        // Optional auto-capture controls via env
-        let capture_first_n = std::env
-            ::var("GB_CAPTURE_FIRST_N")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(10);
-
-        let capture_prefix = std::env
-            ::var("GB_CAPTURE_PREFIX")
-            .unwrap_or_else(|_| "boot-frame".into());
+        let run_state = if config.pause_on_start { RunState::Paused } else { RunState::Running };
+        let initial_deadline = Instant::now() + config.frame_dt;
 
         Ok(Self {
             window: None,
@@ -106,20 +204,19 @@ impl App {
             cpu,
             bus,
             fb: [[0; W]; H],
+            config,
+            run_state,
+            stats: ViewerStats::default(),
+            next_deadline: initial_deadline,
+            redraw_requested: false,
+            pending_present: None,
             o_grid,
             o_window,
             o_axes,
             o_sprites,
             screenshot_id: 0,
-            next_deadline: Instant::now() + FRAME_DT, // cadence kicks in shortly
-            needs_present: false,
-            in_redraw: false,
-            in_compute: false,
             frame_count: 0,
-            capture_first_n,
             captured_so_far: 0,
-            capture_skip: 8, // skip first N frames before capturing
-            capture_prefix,
         })
     }
 
@@ -144,10 +241,253 @@ impl App {
         Ok(())
     }
 
-    /// Uploads the current framebuffer to the Pixels surface and renders it.
-    fn present_current_frame(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        // Copy finished frame from PPU (we only copy if we decided to present)
-        self.bus.gpu.copy_frame(&mut self.fb);
+    fn update_control_flow(&self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        use winit::event_loop::ControlFlow;
+        match self.run_state {
+            RunState::Running | RunState::StepOneFrame => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_deadline));
+            }
+            RunState::Paused => {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            RunState::ExitRequested => {
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        physical_key: PhysicalKey,
+        state: ElementState
+    ) {
+        let mut overlay_changed = false;
+
+        let pressed = state == ElementState::Pressed;
+
+        // Game Boy buttons
+        let gb_button = match physical_key {
+            PhysicalKey::Code(KeyCode::ArrowRight) => Some(Button::Right),
+            PhysicalKey::Code(KeyCode::ArrowLeft) => Some(Button::Left),
+            PhysicalKey::Code(KeyCode::ArrowUp) => Some(Button::Up),
+            PhysicalKey::Code(KeyCode::ArrowDown) => Some(Button::Down),
+            PhysicalKey::Code(KeyCode::KeyZ) => Some(Button::A),
+            PhysicalKey::Code(KeyCode::KeyX) => Some(Button::B),
+            PhysicalKey::Code(KeyCode::Enter) => Some(Button::Start),
+            PhysicalKey::Code(KeyCode::ShiftRight) => Some(Button::Select),
+            _ => None,
+        };
+        if let Some(button) = gb_button {
+            if pressed {
+                self.bus.press_button(button);
+            } else {
+                self.bus.release_button(button);
+            }
+            return; // don't fall through to emulator hotkeys
+        }
+
+        if !pressed {
+            return;
+        }
+
+        match physical_key {
+            PhysicalKey::Code(KeyCode::Space) => {
+                self.run_state = match self.run_state {
+                    RunState::Running => RunState::Paused,
+                    RunState::Paused => {
+                        self.next_deadline = Instant::now() + self.config.frame_dt;
+                        RunState::Running
+                    }
+                    RunState::StepOneFrame => RunState::Paused,
+                    RunState::ExitRequested => RunState::ExitRequested,
+                };
+            }
+            PhysicalKey::Code(KeyCode::KeyN) => {
+                if self.run_state == RunState::Paused {
+                    self.run_state = RunState::StepOneFrame;
+                    self.next_deadline = Instant::now();
+                }
+            }
+            PhysicalKey::Code(KeyCode::KeyR) => {
+                self.next_deadline = Instant::now() + self.config.frame_dt;
+            }
+            PhysicalKey::Code(KeyCode::KeyG) => {
+                self.o_grid = !self.o_grid;
+                overlay_changed = true;
+            }
+            PhysicalKey::Code(KeyCode::KeyW) => {
+                self.o_window = !self.o_window;
+                overlay_changed = true;
+            }
+            PhysicalKey::Code(KeyCode::KeyA) => {
+                self.o_axes = !self.o_axes;
+                overlay_changed = true;
+            }
+            PhysicalKey::Code(KeyCode::KeyS) => {
+                self.o_sprites = !self.o_sprites;
+                overlay_changed = true;
+            }
+            PhysicalKey::Code(KeyCode::F9) => {
+                self.screenshot_id = self.screenshot_id.wrapping_add(1);
+                let filename = format!("acid2-capture-{:03}.png", self.screenshot_id);
+                match self.save_png(&filename) {
+                    Ok(()) => eprintln!("Saved {}", filename),
+                    Err(e) => eprintln!("Save failed: {e}"),
+                }
+            }
+            PhysicalKey::Code(KeyCode::Escape) => {
+                self.run_state = RunState::ExitRequested;
+                event_loop.exit();
+            }
+            _ => {}
+        }
+
+        if overlay_changed {
+            apply_overlay(&mut self.bus, self.o_grid, self.o_window, self.o_axes, self.o_sprites);
+        }
+    }
+
+    fn capture_if_requested(
+        &mut self,
+        frame_index: u64,
+        lcdc: u8,
+        ly_ready: u8,
+        mode_ready: u8
+    ) -> CaptureDecision {
+        if self.frame_count <= self.config.capture_skip {
+            return CaptureDecision::SkippedBeforeWindow;
+        }
+        if self.captured_so_far >= self.config.capture_first_n {
+            return CaptureDecision::SkippedQuotaReached;
+        }
+        if self.config.capture_require_lcd_on && (lcdc & 0x80) == 0 {
+            return CaptureDecision::SkippedLcdOff;
+        }
+
+        let idx = self.captured_so_far + 1;
+        let filename = format!("{}-{:03}.png", self.config.capture_prefix, idx);
+        match self.save_png(&filename) {
+            Ok(()) => {
+                self.captured_so_far = self.captured_so_far.saturating_add(1);
+                if self.config.trace_structured {
+                    eprintln!(
+                        "[TRACE] capture frame={} file={} lcdc={:02X} ly={} mode={}",
+                        frame_index,
+                        filename,
+                        lcdc,
+                        ly_ready,
+                        mode_ready
+                    );
+                }
+                CaptureDecision::Saved(filename)
+            }
+            Err(e) => CaptureDecision::Failed(e.to_string()),
+        }
+    }
+
+    fn emulate_one_frame(&mut self, catchup_in_cycle: u32) {
+        let emu_start = Instant::now();
+        self.stats.emulated_frames = self.stats.emulated_frames.saturating_add(1);
+
+        let mut tcycles: u32 = 0;
+        while tcycles < DMG_DOTS_PER_FRAME {
+            let cy = self.cpu.step(&mut self.bus);
+            tcycles = tcycles.saturating_add(cy);
+        }
+        self.stats.last_emu_time = emu_start.elapsed();
+
+        if self.bus.gpu.take_frame_ready() {
+            self.frame_count = self.frame_count.saturating_add(1);
+            self.bus.gpu.copy_frame(&mut self.fb);
+
+            let ly_ready = self.bus.gpu.ly();
+            let mode_ready = self.bus.gpu.mode_code();
+            let if_reg = self.bus.read_byte(0xff0f);
+            let lcdc = self.bus.read_byte(0xff40);
+            let frame_index = self.bus.gpu
+                .take_last_frame_telemetry()
+                .map(|t| t.frame_index)
+                .unwrap_or(self.frame_count as u64);
+
+            let decision = self.capture_if_requested(frame_index, lcdc, ly_ready, mode_ready);
+            if !self.config.trace_structured {
+                match decision {
+                    CaptureDecision::Saved(name) => eprintln!("Captured {}", name),
+                    CaptureDecision::Failed(msg) => eprintln!("Capture failed: {}", msg),
+                    | CaptureDecision::SkippedBeforeWindow
+                    | CaptureDecision::SkippedQuotaReached
+                    | CaptureDecision::SkippedLcdOff => {}
+                }
+            }
+
+            self.pending_present = Some(PendingPresent {
+                frame_index,
+                ly_ready,
+                mode_ready,
+                if_reg,
+                emu_time: self.stats.last_emu_time,
+                catchup_in_cycle,
+            });
+
+            if !self.redraw_requested {
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                    self.redraw_requested = true;
+                }
+            }
+        }
+    }
+
+    fn emulate_until_deadline(&mut self, now: Instant) {
+        match self.run_state {
+            RunState::Running => {
+                let mut catchup: u32 = 0;
+                while now >= self.next_deadline && catchup < self.config.max_catchup_frames {
+                    self.emulate_one_frame(catchup);
+                    if catchup > 0 {
+                        self.stats.catchup_frames = self.stats.catchup_frames.saturating_add(1);
+                    }
+                    self.next_deadline += self.config.frame_dt;
+                    catchup = catchup.saturating_add(1);
+                }
+
+                if now >= self.next_deadline {
+                    let mut dropped: u64 = 0;
+                    while now >= self.next_deadline {
+                        self.next_deadline += self.config.frame_dt;
+                        dropped = dropped.saturating_add(1);
+                    }
+                    self.stats.dropped_deadlines =
+                        self.stats.dropped_deadlines.saturating_add(dropped);
+                    if self.config.trace_structured {
+                        eprintln!(
+                            "[TRACE] dropped_deadlines={} total={}",
+                            dropped,
+                            self.stats.dropped_deadlines
+                        );
+                    }
+                }
+            }
+            RunState::StepOneFrame => {
+                self.emulate_one_frame(0);
+                self.next_deadline = now + self.config.frame_dt;
+                self.run_state = RunState::Paused;
+            }
+            RunState::Paused | RunState::ExitRequested => {}
+        }
+    }
+
+    fn try_present(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let meta = match self.pending_present.take() {
+            Some(m) => m,
+            None => {
+                self.redraw_requested = false;
+                return;
+            }
+        };
+
+        let present_start = Instant::now();
 
         if let Some(pixels) = &mut self.pixels {
             let frame: &mut [u8] = pixels.frame_mut();
@@ -163,59 +503,28 @@ impl App {
             }
             if let Err(e) = pixels.render() {
                 eprintln!("pixels.render() failed: {e}");
+                self.run_state = RunState::ExitRequested;
                 event_loop.exit();
-            }
-        }
-    }
-
-    /// Run CPU/PPU for one full frame of PPU dots. Returns true if a frame should be presented.
-    fn step_one_frame(&mut self) -> bool {
-        let mut tcycles: u32 = 0;
-        let mut saw_frame_ready = false;
-
-        while tcycles < DMG_DOTS_PER_FRAME {
-            if !saw_frame_ready && self.bus.gpu.frame_is_ready() {
-                saw_frame_ready = true;
-            }
-            let cy = self.cpu.step(&mut self.bus);
-            tcycles = tcycles.saturating_add(cy);
-        }
-
-        let mut should_present = false;
-
-        if saw_frame_ready && self.bus.gpu.take_frame_ready() {
-            self.frame_count = self.frame_count.saturating_add(1);
-            should_present = true;
-
-            // Optional: Skip first N frames, then capture next M frames
-            if self.frame_count > self.capture_skip && self.captured_so_far < self.capture_first_n {
-                // Copy frame (we will present anyway, but we capture now from the fresh PPU buffer)
-                self.bus.gpu.copy_frame(&mut self.fb);
-                let idx = self.captured_so_far + 1;
-                let filename = format!("{}-{:03}.png", self.capture_prefix, idx);
-                match self.save_png(&filename) {
-                    Ok(()) => {
-                        #[cfg(any(feature = "trace_ppu", feature = "debug_timing"))]
-                        eprintln!("Captured {}", filename);
-                    }
-                    Err(e) => eprintln!("Capture failed: {e}"),
-                }
-                self.captured_so_far = self.captured_so_far.saturating_add(1);
+                return;
             }
         }
 
-        #[cfg(any(feature = "trace_ppu", feature = "debug_timing"))]
-        {
+        self.stats.last_present_time = present_start.elapsed();
+        self.stats.presented_frames = self.stats.presented_frames.saturating_add(1);
+        self.redraw_requested = false;
+
+        if self.config.trace_structured {
             eprintln!(
-                "frame done: should_present={}, level_now={}, ly={}",
-                should_present,
-                self.bus.gpu.frame_is_ready(),
-                self.bus.gpu.ly()
+                "[TRACE] frame={} ly={} mode={} if={:02X} emu_ms={:.3} present_ms={:.3} catchup={}",
+                meta.frame_index,
+                meta.ly_ready,
+                meta.mode_ready,
+                meta.if_reg,
+                meta.emu_time.as_secs_f64() * 1000.0,
+                self.stats.last_present_time.as_secs_f64() * 1000.0,
+                meta.catchup_in_cycle
             );
-            eprintln!("LYC={} STAT={:02X}", self.bus.read_byte(0xff45), self.bus.read_byte(0xff41));
         }
-
-        should_present
     }
 }
 
@@ -224,7 +533,7 @@ impl ApplicationHandler for App {
         if self.window.is_none() {
             let scale: u32 = 4;
             let attrs = Window::default_attributes()
-                .with_title("GB Viewer (decoupled cadence)")
+                .with_title("GB Viewer")
                 .with_inner_size(
                     LogicalSize::new(((W as u32) * scale) as f64, ((H as u32) * scale) as f64)
                 )
@@ -233,7 +542,6 @@ impl ApplicationHandler for App {
             let window = event_loop.create_window(attrs).expect("failed to create window");
             let window = Arc::new(window);
 
-            // Pixels<'static> via Arc<Window> clone to SurfaceTexture
             let size = window.inner_size();
             let surface = SurfaceTexture::new(size.width, size.height, window.clone());
             let pixels = Pixels::new(W as u32, H as u32, surface).expect(
@@ -242,9 +550,6 @@ impl ApplicationHandler for App {
 
             self.window = Some(window.clone());
             self.pixels = Some(pixels);
-
-            // Optional one-time kick; cadence will take over anyway
-            window.request_redraw();
         }
     }
 
@@ -260,6 +565,7 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => {
+                self.run_state = RunState::ExitRequested;
                 event_loop.exit();
             }
 
@@ -268,68 +574,18 @@ impl ApplicationHandler for App {
                     if let Err(e) = pixels.resize_surface(size.width, size.height) {
                         eprintln!("pixels.resize_surface failed: {e}");
                     }
+                    if let Err(e) = pixels.resize_buffer(W as u32, H as u32) {
+                        eprintln!("pixels.resize_buffer failed: {e}");
+                    }
                 }
             }
 
             WindowEvent::RedrawRequested => {
-                // Guard against nested delivery of RedrawRequested
-                if self.in_redraw {
-                    return; // Skip nested redraw to avoid stack growth
-                }
-                self.in_redraw = true;
-
-                if self.needs_present {
-                    self.needs_present = false;
-                    self.present_current_frame(event_loop);
-                }
-
-                self.in_redraw = false;
+                self.try_present(event_loop);
             }
 
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key, state, .. }, .. } => {
-                if state == ElementState::Pressed {
-                    let mut overlay_changed = false;
-                    match physical_key {
-                        PhysicalKey::Code(KeyCode::KeyG) => {
-                            self.o_grid = !self.o_grid;
-                            overlay_changed = true;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyW) => {
-                            self.o_window = !self.o_window;
-                            overlay_changed = true;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyA) => {
-                            self.o_axes = !self.o_axes;
-                            overlay_changed = true;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyS) => {
-                            self.o_sprites = !self.o_sprites;
-                            overlay_changed = true;
-                        }
-                        PhysicalKey::Code(KeyCode::F9) => {
-                            self.screenshot_id = self.screenshot_id.wrapping_add(1);
-                            // Copy latest frame before saving
-                            self.bus.gpu.copy_frame(&mut self.fb);
-                            let filename = format!("acid2-capture-{:03}.png", self.screenshot_id);
-                            match self.save_png(&filename) {
-                                Ok(()) => eprintln!("Saved {}", filename),
-                                Err(e) => eprintln!("Save failed: {e}"),
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
-                        _ => {}
-                    }
-
-                    if overlay_changed {
-                        apply_overlay(
-                            &mut self.bus,
-                            self.o_grid,
-                            self.o_window,
-                            self.o_axes,
-                            self.o_sprites
-                        );
-                    }
-                }
+                self.handle_key(event_loop, physical_key, state);
             }
 
             _ => {}
@@ -337,43 +593,32 @@ impl ApplicationHandler for App {
     }
 
     fn new_events(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _cause: StartCause) {
-        // Intentionally empty: cadence & compute handled in about_to_wait()
+        // Intentionally empty: cadence handled in about_to_wait()
     }
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        // Drive cadence (decoupled compute from redraw)
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(self.next_deadline));
+        self.update_control_flow(event_loop);
+
         let now = Instant::now();
-
-        if now >= self.next_deadline {
-            // Avoid re-entrant compute if platform schedules tightly
-            if self.in_compute {
-                self.next_deadline = now + FRAME_DT;
-                return;
-            }
-            self.in_compute = true;
-
-            // Step one whole frame worth of work
-            let present = self.step_one_frame();
-
-            if present {
-                self.needs_present = true;
-                if let Some(win) = &self.window {
-                    win.request_redraw();
+        match self.run_state {
+            RunState::Running => {
+                if now >= self.next_deadline {
+                    self.emulate_until_deadline(now);
                 }
             }
-
-            self.next_deadline = now + FRAME_DT;
-            self.in_compute = false;
+            RunState::StepOneFrame => {
+                self.emulate_until_deadline(now);
+            }
+            RunState::Paused | RunState::ExitRequested => {}
         }
     }
 }
 
 fn main() -> Result<()> {
     let rom_path = std::env::args().nth(1).expect("Usage: viewer <path.gb>");
-    let mut app = App::new(rom_path)?; // propagate errors
-    let event_loop = EventLoop::new()?; // winit 0.30.x returns Result
-    event_loop.run_app(&mut app)?; // returns Result
+    let mut app = App::new(rom_path)?;
+    let event_loop = EventLoop::new()?;
+    event_loop.run_app(&mut app)?;
     Ok(())
 }
 

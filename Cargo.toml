@@ -18,3 +18,4 @@ bitflags = "2.11.0"
 [features]
 debug_timing = []
 trace_ppu = []
+trace_input = []

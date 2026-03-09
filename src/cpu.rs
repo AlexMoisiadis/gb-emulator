@@ -34,6 +34,7 @@ macro_rules! ld_d8 {
 use crate::bus::MemoryBus;
 use crate::instruction::{ DecodeError, Instruction };
 use crate::registers::Registers;
+use crate::trace::{ self, Category as TraceCategory };
 use crate::types::{
     IncDecTarget,
     JumpTest,
@@ -52,7 +53,13 @@ pub struct CPU {
     pub sp: u16,
     pub ime: bool,
     pub halted: bool,
+    halt_bug_armed: bool,
     ei_delay: u8, // NEW: counts down instructions after EI
+    step_index: u64,
+    trace_irq_last_ime: bool,
+    trace_irq_last_ie: u8,
+    trace_irq_last_if: u8,
+    trace_irq_last_pending: u8,
     trace: bool,
     last_pc: u16,
     last_op: u8,
@@ -80,7 +87,13 @@ impl CPU {
             sp: 0xfffe,
             ime: false,
             halted: false,
+            halt_bug_armed: false,
             ei_delay: 0, // NEW
+            step_index: 0,
+            trace_irq_last_ime: false,
+            trace_irq_last_ie: 0,
+            trace_irq_last_if: 0,
+            trace_irq_last_pending: 0,
             trace: false,
             last_pc: 0,
             last_op: 0,
@@ -444,9 +457,29 @@ impl CPU {
         (ie & iflag) != 0
     }
 
+    #[inline]
+    fn trace_cpu_halt_state(&self, bus: &mut MemoryBus) {
+        if !trace::enabled(TraceCategory::CpuHalt) {
+            return;
+        }
+        let (ie, iflag) = Self::read_ie_if(bus);
+        let pending = ie & iflag;
+        eprintln!(
+            "event=cpu_halt step={} halted={} halt_bug_armed={} pending={:02X} ime={}",
+            self.step_index,
+            self.halted as u8,
+            self.halt_bug_armed as u8,
+            pending,
+            self.ime as u8
+        );
+    }
+
     /// Execute a single instruction and return consumed cycles.
 
     pub fn step(&mut self, bus: &mut MemoryBus) -> u32 {
+        self.step_index = self.step_index.saturating_add(1);
+        trace::set_step(self.step_index);
+
         // --- EI delayed-IME semantics ----------------------------------------
         // If EI was executed previously, IME must become 1 *after* the next
         // instruction completes (i.e., between instructions, not immediately).
@@ -458,17 +491,28 @@ impl CPU {
         }
 
         // 1) Execute one instruction and get the cycles it consumed
-        let tcycles: u32 = self.execute_one(bus);
+        let mut total_tcycles: u32 = self.execute_one(bus);
 
         // 2) Advance PPU by the same amount and surface its events into IF now
-        bus.service_gpu(tcycles);
+        bus.service_gpu(total_tcycles);
+        bus.service_timer(total_tcycles);
+        bus.service_input();
 
         // 3) Apply the deferred IME enable (EI delay completes *after* this instr)
 
         if enable_ime_after_this_instruction {
             self.ime = true;
             #[cfg(feature = "debug_timing")]
-            eprintln!("[CPU] IME enabled (EI delay complete)");
+            if !trace::structured_enabled() {
+                eprintln!("[CPU] IME enabled (EI delay complete)");
+            }
+            if trace::enabled(TraceCategory::CpuCtrl) {
+                eprintln!(
+                    "event=cpu_ctrl step={} action=ei_delay_complete ime={}",
+                    self.step_index,
+                    self.ime as u8
+                );
+            }
         }
 
         #[cfg(feature = "debug_timing")]
@@ -480,7 +524,10 @@ impl CPU {
             let pend = ie_now & if_now;
 
             // Only print when one of the values changes (prevents console flood)
-            if ime_now != self.last_ime || ie_now != self.last_ie || if_now != self.last_if {
+            if
+                !trace::structured_enabled() &&
+                (ime_now != self.last_ime || ie_now != self.last_ie || if_now != self.last_if)
+            {
                 eprintln!(
                     "[CPU] IME={} IE={:02X} IF={:02X} pending={:02X}",
                     ime_now as u8,
@@ -495,19 +542,53 @@ impl CPU {
         }
 
         // 4) Interrupt entry: if IME is set and any interrupt is pending, service it now.
-        if self.ime && self.any_pending_interrupt(bus) {
-            self.service_one_interrupt(bus);
-        } else if self.halted && self.any_pending_interrupt(bus) {
+        let ime_now = self.ime;
+        let (ie_now, if_now) = Self::read_ie_if(bus);
+        let pending_now = ie_now & if_now;
+        let mut irq_action = "none";
+        if ime_now && pending_now != 0 {
+            if self.service_one_interrupt(bus) {
+                irq_action = "service";
+                // ISR entry consumes 20 t-cycles on DMG.
+                total_tcycles = total_tcycles.saturating_add(20);
+                bus.service_gpu(20);
+                bus.service_timer(20);
+                bus.service_input();
+            }
+        } else if self.halted && pending_now != 0 {
             // Wake from HALT even if IME is 0 (matches DMG behavior)
             self.halted = false;
+            irq_action = "wake_halt";
+            self.trace_cpu_halt_state(bus);
         }
 
-        tcycles
+        let cpu_irq_changed =
+            ime_now != self.trace_irq_last_ime ||
+            ie_now != self.trace_irq_last_ie ||
+            if_now != self.trace_irq_last_if ||
+            pending_now != self.trace_irq_last_pending;
+        if trace::enabled(TraceCategory::CpuIrq) && (irq_action != "none" || cpu_irq_changed) {
+            eprintln!(
+                "event=cpu_irq step={} ime={} ie={:02X} if={:02X} pending={:02X} action={}",
+                self.step_index,
+                ime_now as u8,
+                ie_now,
+                if_now,
+                pending_now,
+                irq_action
+            );
+        }
+        self.trace_irq_last_ime = ime_now;
+        self.trace_irq_last_ie = ie_now;
+        self.trace_irq_last_if = if_now;
+        self.trace_irq_last_pending = pending_now;
+
+        total_tcycles
     }
 
     /// Service a single interrupt by priority (VBlank -> LCD STAT -> Timer -> Serial -> Joypad).
     /// Clears IF bit, clears IME, pushes PC, and jumps to vector.
-    fn service_one_interrupt(&mut self, bus: &mut MemoryBus) {
+    fn service_one_interrupt(&mut self, bus: &mut MemoryBus) -> bool {
         const IE_ADDR: u16 = 0xffff;
         const IF_ADDR: u16 = 0xff0f;
 
@@ -515,7 +596,7 @@ impl CPU {
         let mut iflag = bus.read_byte(IF_ADDR);
         let pending = ie & iflag;
         if pending == 0 {
-            return;
+            return false;
         }
 
         // Interrupt table (bit, vector)
@@ -549,6 +630,8 @@ impl CPU {
 
         // Disable IME
         self.ime = false;
+        self.halted = false;
+        self.halt_bug_armed = false;
 
         // Push PC to stack (little endian)
         let hi = ((self.pc >> 8) & 0xff) as u8;
@@ -562,7 +645,11 @@ impl CPU {
         self.pc = vector;
 
         #[cfg(feature = "debug_timing")]
-        eprintln!("[CPU] ISR vector={:#06X} (bit {}) IME=OFF", vector, bit);
+        if !trace::structured_enabled() {
+            eprintln!("[CPU] ISR vector={:#06X} (bit {}) IME=OFF", vector, bit);
+        }
+
+        true
     }
 
     #[inline]
@@ -570,16 +657,12 @@ impl CPU {
         // HALT handling: burn cycles or wake, including HALT bug
         if self.halted {
             if Self::pending_interrupt_mask(bus) != 0 {
-                // Wake from HALT
                 self.halted = false;
-
-                // HALT bug check: IME=0 + pending interrupt → next fetch does not increment PC
-                // We'll mark it by not incrementing PC in fetch
-                // This is handled in fetch8 itself
-            } else {
-                // Remain in HALT: burn 4 cycles (do not fetch)
-                return 4;
+                self.trace_cpu_halt_state(bus);
             }
+            // Always return 4 for any HALT cycle — whether spinning or waking.
+            // The next call to step() will execute the actual next instruction.
+            return 4;
         }
 
         // Fetch opcode (fetch8 handles HALT bug automatically)
@@ -620,8 +703,10 @@ impl CPU {
         let addr = self.pc;
         let value = bus.read_byte(addr);
 
-        // HALT bug: if CPU is halted, IME=0, and a pending interrupt exists → PC does not increment
-        if !(self.halted && !self.ime && self.any_pending_interrupt(bus)) {
+        // HALT bug: suppress PC increment exactly once.
+        if self.halt_bug_armed {
+            self.halt_bug_armed = false;
+        } else {
             self.pc = self.pc.wrapping_add(1);
         }
 
@@ -875,12 +960,13 @@ impl CPU {
                 // If IME is enabled or no interrupts are pending, normal HALT
                 if self.ime || !self.any_pending_interrupt(bus) {
                     self.halted = true;
+                    self.halt_bug_armed = false;
                 } else {
-                    // HALT bug: IME = 0 and interrupt pending
-                    // PC will *not* increment on next fetch
-                    // We'll use a special flag in fetch to detect this
-                    self.halted = true; // keep halted true, but fetch will handle bug
+                    // HALT bug: IME=0 and interrupt pending.
+                    self.halted = false;
+                    self.halt_bug_armed = true;
                 }
+                self.trace_cpu_halt_state(bus);
                 4
             }
 
@@ -1464,12 +1550,21 @@ impl CPU {
             Instruction::DI => {
                 self.ime = false;
                 self.ei_delay = 0;
+                self.halt_bug_armed = false;
                 4
             }
             Instruction::RETI => {
                 let addr = self.pop16(bus);
                 self.pc = addr;
                 self.ime = true;
+                if trace::enabled(TraceCategory::CpuCtrl) {
+                    eprintln!(
+                        "event=cpu_ctrl step={} action=reti ime={} pc={:04X}",
+                        self.step_index,
+                        self.ime as u8,
+                        self.pc
+                    );
+                }
                 16
             }
 
@@ -1542,5 +1637,44 @@ impl CPU {
 
     fn trap_unknown(&self, e: DecodeError) -> ! {
         panic!("TRAP: pc={:04X} op={:02X} err={:?}", self.last_pc, self.last_op, e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_cpu_bus(code: &[u8], start: u16) -> (CPU, MemoryBus) {
+        let mut cpu = CPU::new();
+        let mut bus = MemoryBus::new();
+        cpu.pc = start;
+        for (i, b) in code.iter().enumerate() {
+            bus.write_byte(start.wrapping_add(i as u16), *b);
+        }
+        (cpu, bus)
+    }
+
+    #[test]
+    fn halt_bug_suppresses_next_pc_increment_once() {
+        let start = 0xc000;
+        let (mut cpu, mut bus) = setup_cpu_bus(&[0x76, 0x00, 0x00], start); // HALT, NOP, NOP
+        cpu.ime = false;
+        bus.write_byte(0xffff, 0x01); // IE: VBlank
+        bus.write_byte(0xff0f, 0x01); // IF: VBlank pending
+
+        let c1 = cpu.step(&mut bus);
+        assert_eq!(c1, 4);
+        assert_eq!(cpu.pc, start.wrapping_add(1));
+        assert!(cpu.halt_bug_armed);
+        assert!(!cpu.halted);
+
+        let c2 = cpu.step(&mut bus);
+        assert_eq!(c2, 4);
+        assert_eq!(cpu.pc, start.wrapping_add(1)); // no increment once
+        assert!(!cpu.halt_bug_armed);
+
+        let c3 = cpu.step(&mut bus);
+        assert_eq!(c3, 4);
+        assert_eq!(cpu.pc, start.wrapping_add(2));
     }
 }

@@ -6,7 +6,7 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum Button {
     Right,
     Left,
@@ -65,33 +65,60 @@ impl Joypad {
         } else {
             self.buttons |= mask;
         }
+
+        #[cfg(feature = "trace_input")]
+        eprintln!(
+            "[JOY] {:?} {}  buttons={:#010b}",
+            button,
+            if pressed {
+                "DOWN"
+            } else {
+                "UP"
+            },
+            self.buttons
+        );
     }
 
     /// CPU write to FF00
     pub fn write(&mut self, value: u8) {
         // Only bits 4–5 writable
         self.select = value & 0x30;
+        #[cfg(feature = "trace_input")]
+        eprintln!(
+            "[JOY] write FF00 <= {:#04x}  (P14={} P15={})",
+            value,
+            ((value & 0x10) == 0) as u8, // 1 = directions selected
+            ((value & 0x20) == 0) as u8 // 1 = buttons selected
+        );
     }
 
     /// CPU read from FF00
-    pub fn read(&mut self) -> u8 {
-        let mut result = 0xcf; // upper bits read as 1
+    pub fn read(&self) -> u8 {
+        let mut lo = 0x0f; // all 4 input lines idle-high
 
-        // Apply selection
         if (self.select & 0x10) == 0 {
-            // Direction keys selected
-            result &= !(self.buttons & 0x0f);
+            // P14 low — direction keys selected
+            lo &= self.buttons & 0x0f;
         }
-
         if (self.select & 0x20) == 0 {
-            // Button keys selected
-            result &= !((self.buttons >> 4) & 0x0f);
+            // P15 low — action buttons selected
+            lo &= (self.buttons >> 4) & 0x0f;
         }
 
-        result &= !self.select;
+        // bits 7-6: always 1 (unused on DMG)
+        // bits 5-4: reflect select lines written by CPU
+        // bits 3-0: input lines (0 = pressed, 1 = released)
+
+        let result = 0xc0 | self.select | lo;
+        #[cfg(feature = "trace_input")]
+        eprintln!(
+            "[JOY] read  FF00 => {:#04x}  select={:#04x} buttons={:#08b}",
+            result,
+            self.select,
+            self.buttons
+        );
         result
     }
-
     /// Call once per CPU tick to check interrupt edge
     pub fn update_interrupt(&mut self) -> Option<JoypadInterrupt> {
         let current = self.read();

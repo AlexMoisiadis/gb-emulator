@@ -18,6 +18,21 @@ pub struct Cartridge {
 }
 
 impl Cartridge {
+    /// Safe default cartridge used before a ROM is loaded.
+    pub fn empty() -> Self {
+        let header = CartHeader {
+            cart_type: 0x00,
+            rom_size: 0x00,
+            ram_size: 0x00,
+        };
+        let inner: Box<dyn Mapper> = Box::new(NoMbc::new(vec![0xff; 0x8000]));
+        Self {
+            header,
+            mapper_kind: MapperKind::None,
+            inner,
+        }
+    }
+
     /// Build from a file path at the application boundary
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let bytes = std::fs::read(path)?;
@@ -39,7 +54,7 @@ impl Cartridge {
 
         let inner: Box<dyn Mapper> = match mapper_kind {
             MapperKind::None => Box::new(NoMbc::new(rom)),
-            MapperKind::Mbc1 => Box::new(Mbc1::new(rom, header)?),
+            MapperKind::Mbc1 => Box::new(Mbc1::new(rom, &header)?),
             // MapperKind::Mbc2 | MapperKind::Mbc3 | MapperKind::Mbc5 => bail until implemented:
             _ =>
                 bail!(

@@ -8,6 +8,7 @@ pub mod types;
 pub mod mmu;
 pub mod cart;
 pub mod input;
+pub mod trace;
 
 pub use bus::MemoryBus;
 pub use cpu::CPU;

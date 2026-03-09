@@ -7,6 +7,7 @@
 // - STAT rising-edge aggregation without stopping time
 
 use std::array::from_fn;
+use crate::trace::{ self, Category as TraceCategory };
 
 pub const VRAM_BEGIN: u16 = 0x8000;
 pub const VRAM_END: u16 = 0x9fff;
@@ -17,6 +18,9 @@ const TILE_DATA_LEN: usize = 0x1800; // 6 KiB
 
 pub const LCD_WIDTH: usize = 160;
 pub const LCD_HEIGHT: usize = 144;
+const LINE_DOTS: u16 = 456;
+const MODE2_OAM_DOTS: u16 = 80;
+const MODE3_BASE_DOTS: u16 = 172;
 
 type Tile = [[TilePixelValue; 8]; 8];
 
@@ -29,7 +33,24 @@ bitflags::bitflags! {
 
 pub struct GpuEvents {
     pub if_set: IfBits,
+    pub if_from_vblank: bool,
+    pub if_from_stat: bool,
     pub frame_became_ready: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FrameTelemetry {
+    pub frame_index: u64,
+    pub ly_wraps: u64,
+    pub mode_switches: [u32; 4],
+    pub stat_irq_raises: u32,
+    pub stat_m0_edges: u32,
+    pub stat_m1_edges: u32,
+    pub stat_m2_edges: u32,
+    pub stat_lyc_edges: u32,
+    pub vblank_irq_raises: u32,
+    pub frame_ready_ly: u8,
+    pub frame_ready_mode: u8,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -104,21 +125,35 @@ pub struct GPU {
     framebuf: [[u8; LCD_WIDTH]; LCD_HEIGHT],
     stat: u8,
     lyc: u8,
-    lyc_irq_pending: bool,
 
     // OAM DMA (FF46)
     dma_active: bool,
     dma_src_high: u8,
     dma_byte_idx: u16,
     dma_mcycles_left: u16,
+    dma_start_delay_tcycles: u8,
+    dma_tcycle_phase: u8,
 
     // For Mode 3 length (DMG nominal, kept constant here)
     sprites_on_line_count: u8,
     stat_irq_line_prev: bool,
+    stat_mode0_pre_transition: bool,
 
     // Window latches
     wy_latched_this_line: bool,
     wx_latched_for_line: u8,
+    frame_index: u64,
+    ly_wraps: u64,
+    mode_switches: [u32; 4],
+    stat_irq_raises: u32,
+    stat_m0_edges: u32,
+    stat_m1_edges: u32,
+    stat_m2_edges: u32,
+    stat_lyc_edges: u32,
+    vblank_irq_raises: u32,
+    last_frame_telemetry: Option<FrameTelemetry>,
+    mode3_len_latched: u16,
+    hblank_len_latched: u16,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -182,70 +217,134 @@ impl GPU {
             framebuf: [[0; LCD_WIDTH]; LCD_HEIGHT],
             stat: 0,
             lyc: 0,
-            lyc_irq_pending: false,
             dma_active: false,
             dma_src_high: 0,
             dma_byte_idx: 0,
             dma_mcycles_left: 0,
+            dma_start_delay_tcycles: 0,
+            dma_tcycle_phase: 0,
             sprites_on_line_count: 0,
             stat_irq_line_prev: false,
+            stat_mode0_pre_transition: false,
             wy_latched_this_line: false,
             wx_latched_for_line: 0,
+            frame_index: 0,
+            ly_wraps: 0,
+            mode_switches: [0; 4],
+            stat_irq_raises: 0,
+            stat_m0_edges: 0,
+            stat_m1_edges: 0,
+            stat_m2_edges: 0,
+            stat_lyc_edges: 0,
+            vblank_irq_raises: 0,
+            last_frame_telemetry: None,
+            mode3_len_latched: MODE3_BASE_DOTS,
+            hblank_len_latched: LINE_DOTS - MODE2_OAM_DOTS - MODE3_BASE_DOTS,
         }
+    }
+
+    #[inline]
+    fn stat_source_flags_now(&self) -> (bool, bool, bool, bool) {
+        if !self.lcd_enabled() {
+            return (false, false, false, false);
+        }
+        let lyc_src = (self.stat & (1 << 6)) != 0 && self.ly == self.lyc;
+        let m0_src =
+            (self.stat & (1 << 3)) != 0 &&
+            (matches!(self.mode, PpuMode::HBlank0) || self.stat_mode0_pre_transition);
+        let m1_src = (self.stat & (1 << 4)) != 0 && matches!(self.mode, PpuMode::VBlank1);
+        let m2_src = (self.stat & (1 << 5)) != 0 && matches!(self.mode, PpuMode::Oam2);
+        (m0_src, m1_src, m2_src, lyc_src)
     }
 
     #[inline]
     fn stat_line_active_now(&self) -> bool {
-        let lyc_src = (self.stat & (1 << 6)) != 0 && self.ly == self.lyc;
-        let m0_src = (self.stat & (1 << 3)) != 0 && matches!(self.mode, PpuMode::HBlank0);
-        let m1_src = (self.stat & (1 << 4)) != 0 && matches!(self.mode, PpuMode::VBlank1);
-        let m2_src = (self.stat & (1 << 5)) != 0 && matches!(self.mode, PpuMode::Oam2);
-        lyc_src || m0_src || m1_src || m2_src
+        let (m0, m1, m2, lyc) = self.stat_source_flags_now();
+        m0 || m1 || m2 || lyc
+    }
+
+    #[inline]
+    fn drive_stat_line_edge(&mut self) -> bool {
+        let (src_m0, src_m1, src_m2, src_lyc) = self.stat_source_flags_now();
+        let now = self.stat_line_active_now();
+        let prev = self.stat_irq_line_prev;
+        let raised = now && !prev;
+        let changed = now != prev;
+        self.stat_irq_line_prev = now;
+        if raised {
+            self.stat_irq_raises = self.stat_irq_raises.saturating_add(1);
+            if src_m0 {
+                self.stat_m0_edges = self.stat_m0_edges.saturating_add(1);
+            }
+            if src_m1 {
+                self.stat_m1_edges = self.stat_m1_edges.saturating_add(1);
+            }
+            if src_m2 {
+                self.stat_m2_edges = self.stat_m2_edges.saturating_add(1);
+            }
+            if src_lyc {
+                self.stat_lyc_edges = self.stat_lyc_edges.saturating_add(1);
+            }
+        }
+        if trace::enabled(TraceCategory::GpuStat) && changed {
+            eprintln!(
+                "event=gpu_stat step={} frame={} ly={} mode={} line_now={} edge={} src_m0={} src_m1={} src_m2={} src_lyc={}",
+                trace::step(),
+                self.frame_index,
+                self.ly,
+                self.mode_code(),
+                now as u8,
+                raised as u8,
+                src_m0 as u8,
+                src_m1 as u8,
+                src_m2 as u8,
+                src_lyc as u8
+            );
+        }
+        raised
     }
 
     #[inline]
     fn maybe_raise_stat_irq(&mut self, events: &mut GpuEvents) {
-        let now = self.stat_line_active_now();
-        if now && !self.stat_irq_line_prev {
-            events.if_set |= IfBits::LCD_STAT; // rising edge
-        }
-        self.stat_irq_line_prev = now;
-    }
-
-    pub fn begin_frame(&mut self) {
-        self.window_line_counter = 0;
-    }
-
-    // --------- register-ish API ----------
-    pub fn write_lyc(&mut self, v: u8) {
-        self.lyc = v;
-        let equal = self.ly == self.lyc;
-        if equal {
-            self.stat |= 1 << 2;
-            if (self.stat & (1 << 6)) != 0 {
-                self.lyc_irq_pending = true;
-            }
-        } else {
-            self.stat &= !(1 << 2);
+        if self.drive_stat_line_edge() {
+            events.if_set |= IfBits::LCD_STAT;
+            events.if_from_stat = true;
         }
     }
 
     #[inline]
-    pub fn take_lyc_irq_pending(&mut self) -> bool {
-        let p = self.lyc_irq_pending;
-        self.lyc_irq_pending = false;
-        p
+    fn lcd_enabled(&self) -> bool {
+        (self.lcdc & 0x80) != 0
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.window_line_counter = 0;
+        self.wy_latched_this_line = false;
+    }
+
+    // --------- register-ish API ----------
+    pub fn write_lyc(&mut self, v: u8) -> bool {
+        self.lyc = v;
+        self.update_ly_and_lyc();
+        self.stat_mode0_pre_transition = false;
+        self.drive_stat_line_edge()
     }
     #[inline]
     pub fn ly(&self) -> u8 {
         self.ly
     }
     #[inline]
-    pub fn write_stat(&mut self, v: u8) {
+    pub fn write_stat(&mut self, v: u8) -> bool {
         self.stat = (self.stat & 0x07) | (v & 0x78);
+        self.stat_mode0_pre_transition = false;
+        self.drive_stat_line_edge()
     }
     #[inline]
     pub fn read_stat(&self) -> u8 {
+        if !self.lcd_enabled() {
+            // When LCD is disabled, mode/LYC state is forced idle.
+            return 0x80 | (self.stat & 0x78);
+        }
         let coinc = if self.ly == self.lyc { 1 << 2 } else { 0 };
         (self.stat & !(1 << 2)) | coinc | 0x80
     }
@@ -266,6 +365,11 @@ impl GPU {
     #[inline]
     pub fn copy_frame(&self, out: &mut [[u8; LCD_WIDTH]; LCD_HEIGHT]) {
         *out = self.framebuf;
+    }
+
+    #[inline]
+    pub fn take_last_frame_telemetry(&mut self) -> Option<FrameTelemetry> {
+        self.last_frame_telemetry.take()
     }
 
     // OBJ palettes
@@ -289,10 +393,16 @@ impl GPU {
     // OAM access
     #[inline]
     pub fn read_oam(&self, i: usize) -> u8 {
+        if self.lcd_enabled() && matches!(self.mode, PpuMode::Oam2 | PpuMode::Xfer3) {
+            return 0xff;
+        }
         self.oam.get(i).copied().unwrap_or(0)
     }
     #[inline]
     pub fn write_oam(&mut self, i: usize, v: u8) {
+        if self.lcd_enabled() && matches!(self.mode, PpuMode::Oam2 | PpuMode::Xfer3) {
+            return;
+        }
         if i < self.oam.len() {
             self.oam[i] = v;
         }
@@ -300,8 +410,68 @@ impl GPU {
 
     // LCDC & scroll
     #[inline]
-    pub fn set_lcdc(&mut self, v: u8) {
+    pub fn set_lcdc(&mut self, v: u8) -> bool {
+        let old_lcdc = self.lcdc;
+        let was_on = self.lcd_enabled();
+        let now_on = (v & 0x80) != 0;
         self.lcdc = v;
+        let mut stat_edge = false;
+
+        if trace::enabled(TraceCategory::GpuLcdc) && old_lcdc != v {
+            eprintln!(
+                "event=gpu_lcdc step={} ly={} from={:02X} to={:02X} lcd_on={}",
+                trace::step(),
+                self.ly,
+                old_lcdc,
+                v,
+                now_on as u8
+            );
+        }
+
+        match (was_on, now_on) {
+            (true, false) => {
+                // LCD OFF: LY resets and PPU idles in mode 0.
+                self.mode = PpuMode::HBlank0;
+                self.dot_in_mode = 0;
+                self.mode3_len_latched = MODE3_BASE_DOTS;
+                self.hblank_len_latched = LINE_DOTS - MODE2_OAM_DOTS - MODE3_BASE_DOTS;
+                self.ly = 0;
+                self.window_line_counter = 0;
+                self.wy_latched_this_line = false;
+                self.wx_latched_for_line = self.wx;
+                self.frame_ready = false;
+                self.stat = (self.stat & !0x07) | PpuMode::HBlank0.stat_bits();
+                self.stat_irq_line_prev = false;
+                self.stat_mode0_pre_transition = false;
+            }
+            (false, true) => {
+                // LCD ON: restart scanning from LY=0 in mode 2.
+                self.mode = PpuMode::Oam2;
+                self.dot_in_mode = 0;
+                self.latch_visible_line_timing();
+                self.ly = 0;
+                self.window_line_counter = 0;
+                self.wy_latched_this_line = (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+                self.wx_latched_for_line = self.wx;
+                self.stat = (self.stat & !0x03) | PpuMode::Oam2.stat_bits();
+                if self.ly == self.lyc {
+                    self.stat |= 1 << 2;
+                } else {
+                    self.stat &= !(1 << 2);
+                }
+                self.stat_mode0_pre_transition = false;
+                stat_edge = self.drive_stat_line_edge();
+            }
+            _ => {}
+        }
+        stat_edge
+    }
+    #[inline]
+    pub fn write_ly(&mut self, _v: u8) -> bool {
+        self.ly = 0;
+        self.update_ly_and_lyc();
+        self.stat_mode0_pre_transition = false;
+        self.drive_stat_line_edge()
     }
     #[inline]
     pub fn set_scy(&mut self, v: u8) {
@@ -352,33 +522,58 @@ impl GPU {
     pub fn mode_code(&self) -> u8 {
         self.mode.stat_bits()
     }
+    #[inline]
+    pub fn frame_index(&self) -> u64 {
+        self.frame_index
+    }
 
     // --------- timing & DMA ----------
     #[inline]
     fn compute_mode3_length(&self) -> u16 {
-        // Fixed nominal for DMG: keep line length = 456 dots
-        // (Reintroduce variability behind a feature if you want)
-        172
+        // DMG fetch timing has small SCX-dependent variation.
+        // Keep this approximation bounded and preserve 456 dots/line.
+        match self.scx & 0x07 {
+            5..=7 => MODE3_BASE_DOTS + 2,
+            1..=4 => MODE3_BASE_DOTS + 1,
+            _ => MODE3_BASE_DOTS,
+        }
+    }
+
+    #[inline]
+    fn latch_visible_line_timing(&mut self) {
+        self.mode3_len_latched = self.compute_mode3_length();
+        self.hblank_len_latched = LINE_DOTS.saturating_sub(MODE2_OAM_DOTS).saturating_sub(
+            self.mode3_len_latched
+        );
     }
 
     pub fn tick<D: DmaRead>(&mut self, mut tcycles: u32, dma: &mut D) -> GpuEvents {
-        const LINE_DOTS: u16 = 456;
-        const MODE2_OAM: u16 = 80;
-        const MODE3_XFER: u16 = 172; // nominal DMG
-        const MODE0_HBLK: u16 = LINE_DOTS - MODE2_OAM - MODE3_XFER;
+        let mut events = GpuEvents {
+            if_set: IfBits::empty(),
+            if_from_vblank: false,
+            if_from_stat: false,
+            frame_became_ready: false,
+        };
 
-        let mut events = GpuEvents { if_set: IfBits::empty(), frame_became_ready: false };
+        if !self.lcd_enabled() {
+            while tcycles > 0 {
+                tcycles -= 1;
+                self.step_oam_dma(dma);
+            }
+            return events;
+        }
 
         while tcycles > 0 {
             tcycles -= 1;
 
             // 1 byte per M-cycle during OAM DMA
             self.step_oam_dma(dma);
+            self.stat_mode0_pre_transition = false;
 
             match self.mode {
                 PpuMode::HBlank0 => {
                     self.dot_in_mode = self.dot_in_mode.saturating_add(1);
-                    if self.dot_in_mode >= MODE0_HBLK {
+                    if self.dot_in_mode >= self.hblank_len_latched {
                         self.dot_in_mode = 0;
                         // End of scanline: advance LY and decide next mode
                         self.ly = self.ly.wrapping_add(1);
@@ -386,32 +581,82 @@ impl GPU {
                         if self.ly == 144 {
                             // Enter VBlank
                             self.mode = PpuMode::VBlank1;
-                            self.set_stat_mode(PpuMode::VBlank1, &mut events);
+                            self.set_stat_mode(PpuMode::VBlank1);
 
                             // Raise VBlank IF exactly once (on entry to LY=144)
                             events.if_set |= IfBits::VBLANK;
+                            events.if_from_vblank = true;
+                            self.vblank_irq_raises = self.vblank_irq_raises.saturating_add(1);
                             if !self.frame_ready {
                                 self.frame_ready = true;
                                 events.frame_became_ready = true;
+                                self.frame_index = self.frame_index.saturating_add(1);
+                                let mode_switches = self.mode_switches;
+                                let stat_irq_raises = self.stat_irq_raises;
+                                let stat_m0_edges = self.stat_m0_edges;
+                                let stat_m1_edges = self.stat_m1_edges;
+                                let stat_m2_edges = self.stat_m2_edges;
+                                let stat_lyc_edges = self.stat_lyc_edges;
+                                let vblank_irq_raises = self.vblank_irq_raises;
+                                self.last_frame_telemetry = Some(FrameTelemetry {
+                                    frame_index: self.frame_index,
+                                    ly_wraps: self.ly_wraps,
+                                    mode_switches,
+                                    stat_irq_raises,
+                                    stat_m0_edges,
+                                    stat_m1_edges,
+                                    stat_m2_edges,
+                                    stat_lyc_edges,
+                                    vblank_irq_raises,
+                                    frame_ready_ly: self.ly,
+                                    frame_ready_mode: self.mode_code(),
+                                });
+                                self.mode_switches = [0; 4];
+                                self.stat_irq_raises = 0;
+                                self.stat_m0_edges = 0;
+                                self.stat_m1_edges = 0;
+                                self.stat_m2_edges = 0;
+                                self.stat_lyc_edges = 0;
+                                self.vblank_irq_raises = 0;
+                                if trace::enabled(TraceCategory::Frame) {
+                                    eprintln!(
+                                        "event=frame step={} frame={} ly_wraps={} m0={} m1={} m2={} m3={} stat_irq={} stat_m0={} stat_m1={} stat_m2={} stat_lyc={} vblank_irq={}",
+                                        trace::step(),
+                                        self.frame_index,
+                                        self.ly_wraps,
+                                        mode_switches[0],
+                                        mode_switches[1],
+                                        mode_switches[2],
+                                        mode_switches[3],
+                                        stat_irq_raises,
+                                        stat_m0_edges,
+                                        stat_m1_edges,
+                                        stat_m2_edges,
+                                        stat_lyc_edges,
+                                        vblank_irq_raises
+                                    );
+                                }
                             }
-                            self.update_ly_and_lyc(&mut events);
+                            self.update_ly_and_lyc();
                         } else if self.ly < 144 {
                             // Start of a visible scanline: Mode 2
                             self.mode = PpuMode::Oam2;
                             // WY latch for the new line: window enabled AND WY == current LY
-                            self.wy_latched_this_line =
-                                (self.lcdc & 0x20) != 0 && self.ly == self.wy;
-                            self.set_stat_mode(PpuMode::Oam2, &mut events);
-                            self.update_ly_and_lyc(&mut events);
+                            if (self.lcdc & 0x20) != 0 && self.ly == self.wy {
+                                self.wy_latched_this_line = true;
+                            }
+                            self.set_stat_mode(PpuMode::Oam2);
+                            self.update_ly_and_lyc();
                         } else if self.ly > 153 {
                             // Wrap to LY=0 and begin new frame
                             self.ly = 0;
+                            self.ly_wraps = self.ly_wraps.saturating_add(1);
                             self.window_line_counter = 0;
                             self.mode = PpuMode::Oam2;
                             self.wy_latched_this_line =
                                 (self.lcdc & 0x20) != 0 && self.ly == self.wy;
-                            self.set_stat_mode(PpuMode::Oam2, &mut events);
-                            self.update_ly_and_lyc(&mut events);
+                            self.set_stat_mode(PpuMode::Oam2);
+                            self.update_ly_and_lyc();
                         }
                     }
                 }
@@ -424,56 +669,63 @@ impl GPU {
                         if self.ly > 153 {
                             // Leave VBlank -> begin new frame at LY=0
                             self.ly = 0;
+                            self.ly_wraps = self.ly_wraps.saturating_add(1);
                             self.window_line_counter = 0;
                             self.mode = PpuMode::Oam2;
                             self.wy_latched_this_line =
                                 (self.lcdc & 0x20) != 0 && self.ly == self.wy;
-                            self.set_stat_mode(PpuMode::Oam2, &mut events);
-                            self.update_ly_and_lyc(&mut events);
+                            self.set_stat_mode(PpuMode::Oam2);
+                            self.update_ly_and_lyc();
                         } else {
                             // Stay in VBlank
-                            self.update_ly_and_lyc(&mut events);
+                            self.update_ly_and_lyc();
                         }
                     }
                 }
 
                 PpuMode::Oam2 => {
                     self.dot_in_mode = self.dot_in_mode.saturating_add(1);
-                    if self.dot_in_mode >= MODE2_OAM {
+                    if self.dot_in_mode >= MODE2_OAM_DOTS {
                         // Enter Mode 3 exactly once per visible line
                         self.dot_in_mode = 0;
                         self.mode = PpuMode::Xfer3;
 
                         // WX latch for this line at Mode 3 start
                         self.wx_latched_for_line = self.wx;
-                        self.set_stat_mode(PpuMode::Xfer3, &mut events);
+                        self.set_stat_mode(PpuMode::Xfer3);
 
                         // Count sprites overlapping this line
                         self.sprites_on_line_count = self.count_sprites_on_line();
+                        self.latch_visible_line_timing();
+                    }
+                }
 
-                        // Render the line
+                PpuMode::Xfer3 => {
+                    if self.dot_in_mode.saturating_add(1) >= self.mode3_len_latched {
+                        // DMG nuance: mode-0 STAT source goes high one dot
+                        // before the mode 3 -> mode 0 transition.
+                        self.stat_mode0_pre_transition = true;
+                        self.maybe_raise_stat_irq(&mut events);
+                    }
+                    self.dot_in_mode = self.dot_in_mode.saturating_add(1);
+                    if self.dot_in_mode >= self.mode3_len_latched {
+                        // Render at mode-3 completion (just before entering HBlank).
                         let ly = self.ly;
                         let mut line = [0u8; LCD_WIDTH];
                         self.render_scanline(ly, &mut line);
                         self.render_scanline_objs(ly, &mut line);
                         self.overlay_debug_scanline(ly, &mut line);
                         self.framebuf[ly as usize] = line;
-                    }
-                }
 
-                PpuMode::Xfer3 => {
-                    self.dot_in_mode = self.dot_in_mode.saturating_add(1);
-                    // Fixed DMG length for determinism
-                    if self.dot_in_mode >= self.compute_mode3_length() {
                         self.dot_in_mode = 0;
                         self.mode = PpuMode::HBlank0;
-                        self.set_stat_mode(PpuMode::HBlank0, &mut events);
+                        self.set_stat_mode(PpuMode::HBlank0);
                     }
                 }
             }
 
-            // STAT rising-edge check once per dot
-            // (This call considers LYC, Mode sources as of *current* state)
+            // Checkpoint B: evaluate normal STAT sources after state updates.
+            self.stat_mode0_pre_transition = false;
             self.maybe_raise_stat_irq(&mut events);
         }
 
@@ -484,11 +736,19 @@ impl GPU {
         if !self.dma_active {
             return;
         }
-        if self.dma_mcycles_left == 0 {
+        if self.dma_start_delay_tcycles > 0 {
+            self.dma_start_delay_tcycles -= 1;
+            return;
+        }
+        self.dma_tcycle_phase = self.dma_tcycle_phase.wrapping_add(1);
+        if self.dma_tcycle_phase < 4 {
+            return;
+        }
+        self.dma_tcycle_phase = 0;
+        if self.dma_mcycles_left == 0 || self.dma_byte_idx >= 160 {
             self.dma_active = false;
             return;
         }
-
         self.dma_mcycles_left -= 1;
 
         if self.dma_byte_idx < 160 {
@@ -525,20 +785,24 @@ impl GPU {
     }
 
     #[inline]
-    fn set_stat_mode(&mut self, mode: PpuMode, _events: &mut GpuEvents) {
-        self.stat = (self.stat & !0x03) | mode.stat_bits();
-        // No immediate IF; we’ll check rising-edge in maybe_raise_stat_irq()
+    fn set_stat_mode(&mut self, mode: PpuMode) {
+        let old_mode = self.stat & 0x03;
+        let new_mode = mode.stat_bits();
+        if old_mode != new_mode {
+            self.mode_switches[new_mode as usize] =
+                self.mode_switches[new_mode as usize].saturating_add(1);
+        }
+        self.stat = (self.stat & !0x03) | new_mode;
+        // No immediate IF; rising-edge is checked at STAT checkpoints.
     }
 
     #[inline]
-    fn update_ly_and_lyc(&mut self, _events: &mut GpuEvents) {
+    fn update_ly_and_lyc(&mut self) {
         if self.ly == self.lyc {
             self.stat |= 1 << 2;
         } else {
             self.stat &= !(1 << 2);
         }
-        // Rising-edge from LYC enable is handled in maybe_raise_stat_irq(),
-        // which runs once per dot.
     }
 
     // -------- VRAM helpers --------
@@ -562,10 +826,16 @@ impl GPU {
 
     #[inline]
     pub fn read_vram(&self, index: usize) -> u8 {
+        if self.lcd_enabled() && matches!(self.mode, PpuMode::Xfer3) {
+            return 0xff;
+        }
         self.vram.get(index).copied().unwrap_or(0)
     }
 
     pub fn write_vram(&mut self, index: usize, value: u8) {
+        if self.lcd_enabled() && matches!(self.mode, PpuMode::Xfer3) {
+            return;
+        }
         if index >= VRAM_SIZE {
             return;
         }
@@ -678,7 +948,9 @@ impl GPU {
         if window_used_this_line {
             self.window_line_counter = self.window_line_counter.wrapping_add(1);
             #[cfg(feature = "trace_ppu")]
-            eprintln!("[PPU] window drew on ly={}, start_x={}", ly, win_left_latched);
+            if !trace::structured_enabled() {
+                eprintln!("[PPU] window drew on ly={}, start_x={}", ly, win_left_latched);
+            }
         }
     }
 
@@ -962,10 +1234,85 @@ impl GPU {
         self.dma_src_high = v;
         self.dma_byte_idx = 0;
         self.dma_mcycles_left = 160; // 160 M-cycles (normal speed)
+        self.dma_start_delay_tcycles = 4; // one M-cycle startup delay
+        self.dma_tcycle_phase = 0;
     }
 
     #[inline]
     pub fn dma_in_progress(&self) -> bool {
         self.dma_active
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoDma;
+    impl DmaRead for NoDma {
+        fn read8(&mut self, _addr: u16) -> u8 {
+            0
+        }
+    }
+
+    #[test]
+    fn stat_irq_is_rising_edge_only_across_source_overlap() {
+        let mut gpu = GPU::new();
+        gpu.mode = PpuMode::Oam2;
+        gpu.set_stat_mode(PpuMode::Oam2);
+        gpu.ly = 0;
+        gpu.lyc = 0;
+        gpu.update_ly_and_lyc();
+
+        assert!(!gpu.write_stat(0x00));
+        assert!(gpu.write_stat(1 << 5)); // M2 source goes low->high.
+        assert!(!gpu.write_stat(1 << 6)); // Switch to LYC source while line stays high.
+        assert!(!gpu.write_stat(0x00)); // Line drops low.
+        assert!(gpu.write_stat(1 << 6)); // Low->high again.
+    }
+
+    #[test]
+    fn mode0_pre_transition_raises_once() {
+        let mut gpu = GPU::new();
+        let mut dma = NoDma;
+
+        gpu.mode = PpuMode::Xfer3;
+        gpu.set_stat_mode(PpuMode::Xfer3);
+        gpu.dot_in_mode = gpu.mode3_len_latched.saturating_sub(1);
+        gpu.write_stat(1 << 3); // Enable mode-0 STAT source only.
+        gpu.stat_irq_line_prev = false;
+
+        let events = gpu.tick(1, &mut dma);
+        assert!(events.if_from_stat);
+        assert!(events.if_set.contains(IfBits::LCD_STAT));
+        assert_eq!(gpu.mode_code(), PpuMode::HBlank0.stat_bits());
+        assert_eq!(gpu.stat_irq_raises, 1);
+    }
+
+    #[test]
+    fn lyc_write_can_raise_immediate_stat_edge() {
+        let mut gpu = GPU::new();
+        gpu.mode = PpuMode::Xfer3;
+        gpu.set_stat_mode(PpuMode::Xfer3);
+        gpu.ly = 23;
+        gpu.lyc = 0;
+        gpu.update_ly_and_lyc();
+        assert!(!gpu.write_stat(1 << 6)); // Enable LYC source while mismatch.
+        assert!(gpu.write_lyc(23)); // Match LY immediately -> edge.
+        assert!(!gpu.write_lyc(23)); // Line is still high, no retrigger.
+    }
+
+    #[test]
+    fn stat_write_enabling_true_source_raises_once() {
+        let mut gpu = GPU::new();
+        gpu.mode = PpuMode::Oam2;
+        gpu.set_stat_mode(PpuMode::Oam2);
+        gpu.ly = 10;
+        gpu.lyc = 42;
+        gpu.update_ly_and_lyc();
+
+        assert!(!gpu.write_stat(0x00));
+        assert!(gpu.write_stat(1 << 5)); // Enable M2 while in mode 2.
+        assert!(!gpu.write_stat(1 << 5)); // Still high, blocked.
     }
 }
