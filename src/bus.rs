@@ -37,6 +37,7 @@ pub struct MemoryBus {
     timer: Timer,
     pub apu: Apu,
     audio: Option<AudioOutput>,
+    pub audio_muted: bool,
 }
 
 impl MemoryBus {
@@ -54,6 +55,7 @@ impl MemoryBus {
             timer: Timer::new(),
             apu: Apu::new(sample_rate),
             audio,
+            audio_muted: false,
         }
     }
 
@@ -66,13 +68,22 @@ impl MemoryBus {
         self.apply_gpu_events(events);
     }
 
+    pub fn toggle_mute(&mut self) -> bool {
+        self.audio_muted = !self.audio_muted;
+        self.audio_muted
+    }
+
     #[inline]
     // In service loop (alongside service_gpu / service_timer):
     pub fn service_apu(&mut self, tcycles: u32) {
         self.apu.tick(tcycles);
         if let Some(audio) = &mut self.audio {
-            for sample in self.apu.sample_buffer.drain(..) {
-                let _ = audio.producer.try_push(sample);
+            if self.audio_muted {
+                self.apu.sample_buffer.clear(); // discard, keep buffer from growing
+            } else {
+                for sample in self.apu.sample_buffer.drain(..) {
+                    let _ = audio.producer.try_push(sample);
+                }
             }
         }
     }
@@ -102,14 +113,6 @@ impl MemoryBus {
             // Front-end can observe via gpu.take_frame_ready()
         }
     }
-
-    // #[inline]
-    // pub fn service_timer(&mut self, tcycles: u32) {
-    //     let mcycles = tcycles / 4;
-    //     if mcycles > 0 && self.timer.tick(mcycles) {
-    //         self.raise_interrupt(InterruptSource::Timer);
-    //     }
-    // }
 
     pub fn press_button(&mut self, button: crate::input::joypad::Button) {
         self.mmu.joypad.press(button);

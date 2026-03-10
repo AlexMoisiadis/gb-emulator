@@ -1,7 +1,6 @@
 use gb_emulator::{ CPU, MemoryBus };
 use gb_emulator::trace::{ self, Category as TraceCategory };
-use std::{ fs::File, path::Path };
-use png::{ Encoder, ColorType, BitDepth };
+use gb_emulator::util::save_png;
 
 const W: usize = 160;
 const H: usize = 144;
@@ -12,13 +11,11 @@ enum TimeoutMode {
     LcdAware,
 }
 
-fn dmg_shade_to_u8(v: u8) -> u8 {
-    match v & 0b11 {
-        0 => 255,
-        1 => 170,
-        2 => 85,
-        _ => 0,
-    }
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TimeoutReason {
+    None,
+    Budget,
+    LcdOffWindow,
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -40,21 +37,6 @@ fn frame_hash_hex(fb: &[[u8; W]; H]) -> String {
     format!("{:016x}", fnv1a64(&flat))
 }
 
-fn save_png<P: AsRef<Path>>(fb: &[[u8; W]; H], path: P) -> anyhow::Result<()> {
-    let mut gray = vec![0u8; W * H];
-    for y in 0..H {
-        for x in 0..W {
-            gray[y * W + x] = dmg_shade_to_u8(fb[y][x]);
-        }
-    }
-    let file = File::create(path.as_ref())?;
-    let mut enc = Encoder::new(file, W as u32, H as u32);
-    enc.set_color(ColorType::Grayscale);
-    enc.set_depth(BitDepth::Eight);
-    let mut writer = enc.write_header()?;
-    writer.write_image_data(&gray)?;
-    Ok(())
-}
 fn main() -> anyhow::Result<()> {
     let rom_path = std::env::args().nth(1).expect("Usage: headless <path.gb>");
     let rom = std::fs::read(rom_path)?;
@@ -115,13 +97,13 @@ fn main() -> anyhow::Result<()> {
     for f in 0..frames_to_dump {
         let mut safety_dots = 0u32;
         let mut lcd_on_seen = (bus.read_byte(0xff40) & 0x80) != 0;
-        let mut timeout_reason = "none";
+        let mut timeout_reason = TimeoutReason::None;
         while !bus.gpu.frame_is_ready() {
             if safety_dots >= timeout_dots {
                 timeout_reason = match timeout_mode {
-                    TimeoutMode::Strict => "budget",
-                    TimeoutMode::LcdAware if lcd_on_seen => "budget",
-                    TimeoutMode::LcdAware => "lcd_off_window",
+                    TimeoutMode::Strict => TimeoutReason::Budget,
+                    TimeoutMode::LcdAware if lcd_on_seen => TimeoutReason::Budget,
+                    TimeoutMode::LcdAware => TimeoutReason::LcdOffWindow,
                 };
                 break;
             }
@@ -147,7 +129,7 @@ fn main() -> anyhow::Result<()> {
                 lcd_on_seen = true;
             }
         }
-        if bus.gpu.take_frame_ready() && timeout_reason == "none" {
+        if bus.gpu.take_frame_ready() && timeout_reason == TimeoutReason::None {
             // Keep the latest rendered frame in fb; we only save at the end.
             bus.gpu.copy_frame(&mut fb);
             if print_hashes {
@@ -157,23 +139,24 @@ fn main() -> anyhow::Result<()> {
         } else {
             let in_warmup = f < warmup_frames;
             match timeout_reason {
-                "lcd_off_window" => {
+                TimeoutReason::LcdOffWindow => {
                     lcd_off_skips = lcd_off_skips.saturating_add(1);
                 }
-                "budget" if in_warmup => {
+                TimeoutReason::Budget if in_warmup => {
                     warmup_timeouts = warmup_timeouts.saturating_add(1);
                 }
-                "budget" => {
+                TimeoutReason::Budget => {
                     hard_timeouts = hard_timeouts.saturating_add(1);
                     eprintln!("Frame {} timed out waiting for frame_ready", f);
                 }
-                _ => {}
+                TimeoutReason::None => {}
             }
             if trace::enabled(TraceCategory::Harness) {
+                let timed_out = (timeout_reason == TimeoutReason::Budget) as u8;
                 eprintln!(
-                    "event=harness frame_req={} timeout={} reason={} lcd_on_seen={} dots={}",
+                    "event=harness frame_req={} timeout={} reason={:?} lcd_on_seen={} dots={}",
                     f + 1,
-                    (timeout_reason == "budget") as u8,
+                    timed_out,
                     timeout_reason,
                     lcd_on_seen as u8,
                     safety_dots

@@ -1,6 +1,7 @@
 pub mod bus;
 pub mod cpu;
 pub mod gpu;
+pub mod util;
 pub mod instruction;
 pub mod registers;
 pub mod timer;
@@ -21,4 +22,3 @@ pub use timer::Timer;
 pub use types::{ ArithmeticTarget, JumpTest };
 pub use cart::Cartridge;
 pub use input::joypad::Joypad;
-// pub use sound::ch1::APU;

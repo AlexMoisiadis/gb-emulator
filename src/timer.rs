@@ -1,5 +1,8 @@
 // src/timer.rs
 
+const TAC_FREQ_MASK: u8 = 0b11; // bits 1–0: clock source select
+const TAC_ENABLE_BIT: u8 = 0b100; // bit 2: timer enable
+
 /// Game Boy timer block: DIV/TIMA/TMA/TAC with **edge-based increments**
 /// and DMG quirks: DIV/TAC "glitch" ticks, delayed TMA reload, and
 /// write-to-TIMA cancel window (1 M-cycle).
@@ -44,7 +47,7 @@ impl Timer {
     /// Map TAC bits to the corresponding bit of div_counter
     #[inline]
     fn map_tac_bit(sel: u8) -> u8 {
-        match sel & 0b11 {
+        match sel & TAC_FREQ_MASK {
             0b00 => 9, // 4096 Hz
             0b01 => 3, // 262144 Hz
             0b10 => 5, // 65536 Hz
@@ -56,7 +59,7 @@ impl Timer {
     /// Refresh enable + source bit selection; also resample prev bit state.
     #[inline]
     fn update_tac_common(&mut self) {
-        self.timer_enabled = (self.tac & 0b100) != 0;
+        self.timer_enabled = (self.tac & TAC_ENABLE_BIT) != 0;
         self.timer_bit = Self::map_tac_bit(self.tac);
         self.prev_timer_bit_state = ((self.div_counter >> self.timer_bit) & 1) != 0;
     }

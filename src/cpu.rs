@@ -75,12 +75,6 @@ pub struct CPU {
 
 impl CPU {
     pub fn new() -> Self {
-        // Blargg
-        // let mut regs = Registers::default();
-        // regs.set_af(0x01b0);
-        // regs.set_bc(0x0013);
-        // regs.set_de(0x00d8);
-        // regs.set_hl(0x014d);
         Self {
             regs: Registers::default(),
             pc: 0x0000,
@@ -410,47 +404,11 @@ impl CPU {
         (ie, iflag)
     }
 
-    // #[inline]
-    // fn write_if(bus: &mut MemoryBus, val: u8) {
-    //     bus.write_byte(0xff0f, val);
-    // }
-
     #[inline]
     fn pending_interrupt_mask(bus: &mut MemoryBus) -> u8 {
         let (ie, iflag) = Self::read_ie_if(bus);
         ie & iflag
     }
-
-    // fn service_interrupt(&mut self, bus: &mut MemoryBus) -> u32 {
-    //     // Priority: bit0..bit4 => vectors 0x40,0x48,0x50,0x58,0x60
-    //     let (ie, iflag) = Self::read_ie_if(bus);
-    //     let pending = ie & iflag;
-    //     if pending == 0 {
-    //         return 0;
-    //     }
-
-    //     let (bit, vector) = if (pending & 0x01) != 0 {
-    //         (0, 0x0040)
-    //     } else if (pending & 0x02) != 0 {
-    //         (1, 0x0048)
-    //     } else if (pending & 0x04) != 0 {
-    //         (2, 0x0050)
-    //     } else if (pending & 0x08) != 0 {
-    //         (3, 0x0058)
-    //     } else {
-    //         (4, 0x0060)
-    //     };
-
-    //     // Clear IF bit
-    //     let new_if = iflag & !(1 << bit);
-    //     Self::write_if(bus, new_if);
-
-    //     // Enter ISR
-    //     self.ime = false;
-    //     self.push16(bus, self.pc);
-    //     self.pc = vector;
-    //     20 // cycles for ISR entry
-    // }
 
     fn any_pending_interrupt(&self, bus: &mut MemoryBus) -> bool {
         let (ie, iflag) = Self::read_ie_if(bus);
@@ -1143,52 +1101,17 @@ impl CPU {
             }
 
             // ---------- ALU group ----------
-            Instruction::AddA(src) => {
-                let b = self.read_from_source(bus, src);
-                let a = self.regs.a;
-                self.regs.a = self.alu_add8(a, b);
-                CPU::alu_cycles(&src)
-            }
-            Instruction::AdcA(src) => {
-                let b = self.read_from_source(bus, src);
-                let a = self.regs.a;
-                self.regs.a = self.alu_adc8(a, b);
-                CPU::alu_cycles(&src)
-            }
-            Instruction::SubA(src) => {
-                let b = self.read_from_source(bus, src);
-                let a = self.regs.a;
-                self.regs.a = self.alu_sub8(a, b);
-                CPU::alu_cycles(&src)
-            }
-            Instruction::SbcA(src) => {
-                let b = self.read_from_source(bus, src);
-                let a = self.regs.a;
-                self.regs.a = self.alu_sbc8(a, b);
-                CPU::alu_cycles(&src)
-            }
-            Instruction::AndA(src) => {
-                let b = self.read_from_source(bus, src);
-                let a = self.regs.a;
-                self.regs.a = self.alu_and8(a, b);
-                CPU::alu_cycles(&src)
-            }
-            Instruction::XorA(src) => {
-                let b = self.read_from_source(bus, src);
-                let a = self.regs.a;
-                self.regs.a = self.alu_xor8(a, b);
-                CPU::alu_cycles(&src)
-            }
-            Instruction::OrA(src) => {
-                let b = self.read_from_source(bus, src);
-                let a = self.regs.a;
-                self.regs.a = self.alu_or8(a, b);
-                CPU::alu_cycles(&src)
-            }
+            Instruction::AddA(src) => self.exec_alu_op(bus, src, CPU::alu_add8),
+            Instruction::AdcA(src) => self.exec_alu_op(bus, src, CPU::alu_adc8),
+            Instruction::SubA(src) => self.exec_alu_op(bus, src, CPU::alu_sub8),
+            Instruction::SbcA(src) => self.exec_alu_op(bus, src, CPU::alu_sbc8),
+            Instruction::AndA(src) => self.exec_alu_op(bus, src, CPU::alu_and8),
+            Instruction::XorA(src) => self.exec_alu_op(bus, src, CPU::alu_xor8),
+            Instruction::OrA(src)  => self.exec_alu_op(bus, src, CPU::alu_or8),
             Instruction::CpA(src) => {
                 let b = self.read_from_source(bus, src);
                 let a = self.regs.a;
-                self.alu_cp8(a, b); // A unchanged
+                self.alu_cp8(a, b); // A unchanged, only flags set
                 CPU::alu_cycles(&src)
             }
 
@@ -1286,13 +1209,6 @@ impl CPU {
                 let r = self.alu_dec8(v);
                 bus.write_byte(addr, r);
                 12
-            }
-
-            // Keep your 16-bit INC (BC) case
-            Instruction::INC(IncDecTarget::BC) => {
-                let bc = self.regs.get_bc().wrapping_add(1);
-                self.regs.set_bc(bc);
-                8
             }
 
             // ---------- LD r,d8 (explicit to ensure 8 cycles) ----------
@@ -1570,6 +1486,12 @@ impl CPU {
                 16
             }
 
+            // ---------- 16-bit INC ----------
+            Instruction::INC(IncDecTarget::BC) => {
+                let v = self.regs.get_bc().wrapping_add(1);
+                self.regs.set_bc(v);
+                8
+            }
             Instruction::INC(IncDecTarget::DE) => {
                 let v = self.regs.get_de().wrapping_add(1);
                 self.regs.set_de(v);
@@ -1612,6 +1534,21 @@ impl CPU {
                 self.trap_unknown(DecodeError::UnknownOpcode(0x00, false))
             }
         }
+    }
+
+    /// Run one of the 8 binary ALU ops that read src, apply op, and write back to A.
+    #[inline]
+    fn exec_alu_op(
+        &mut self,
+        bus: &mut MemoryBus,
+        src: LoadByteSource,
+        op: fn(&mut CPU, u8, u8) -> u8,
+    ) -> u32 {
+        let b = self.read_from_source(bus, src);
+        let a = self.regs.a;
+        let result = op(self, a, b);
+        self.regs.a = result;
+        CPU::alu_cycles(&src)
     }
 
     // INC helpers use the same flag rules as 8-bit INC/DEC instructions

@@ -1,4 +1,5 @@
 /target
+.claude/
 *.png
 *.bin
 *.txt

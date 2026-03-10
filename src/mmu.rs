@@ -202,149 +202,30 @@ impl MMU {
         }
 
         match addr {
-            0x0000..=0x7fff => self.cart.write(addr, value),
-            0xa000..=0xbfff => self.cart.write(addr, value),
+            0x0000..=0x7fff | 0xa000..=0xbfff => self.cart.write(addr, value),
+
+            VRAM_BEGIN..=VRAM_END => gpu.write_vram_abs(addr, value),
+
+            OAM_BEGIN..=OAM_END => gpu.write_oam((addr - OAM_BEGIN) as usize, value),
 
             IO_JOYPAD => {
                 Self::trace_io_write(addr, value, gpu);
                 self.joypad.write(value);
             }
 
-            VRAM_BEGIN..=VRAM_END => {
-                gpu.write_vram_abs(addr, value);
-            }
-
-            OAM_BEGIN..=OAM_END => {
-                let off = (addr - OAM_BEGIN) as usize;
-                gpu.write_oam(off, value);
-            }
-
-            IO_LCDC => {
-                Self::trace_io_write(addr, value, gpu);
-                if gpu.set_lcdc(value) {
-                    self.set_if_bits(0x02);
-                }
-            }
-
-            IO_SCY => {
-                Self::trace_io_write(addr, value, gpu);
-                let _old = gpu.get_scy();
-                gpu.set_scy(value);
-                #[cfg(feature = "trace_ppu")]
-                if !trace::structured_enabled() {
-                    eprintln!(
-                        "[CPU] SCY <= {:>3} at ly={}, mode={}",
-                        value,
-                        gpu.ly(),
-                        gpu.mode_code()
-                    );
-                }
-            }
-
-            IO_SCX => {
-                Self::trace_io_write(addr, value, gpu);
-                let _old = gpu.get_scx();
-                gpu.set_scx(value);
-                #[cfg(feature = "trace_ppu")]
-                if !trace::structured_enabled() {
-                    eprintln!(
-                        "[CPU] SCX <= {:>3} at ly={}, mode={}",
-                        value,
-                        gpu.ly(),
-                        gpu.mode_code()
-                    );
-                }
-            }
-
-            IO_BGP => {
-                Self::trace_io_write(addr, value, gpu);
-                gpu.set_bgp(value);
-            }
-            IO_OBP0 => {
-                Self::trace_io_write(addr, value, gpu);
-                gpu.set_obp0(value);
-            }
-            IO_OBP1 => {
-                Self::trace_io_write(addr, value, gpu);
-                gpu.set_obp1(value);
-            }
-
-            IO_WY => {
-                Self::trace_io_write(addr, value, gpu);
-                let _old = gpu.get_wy();
-                gpu.set_wy(value);
-                #[cfg(feature = "trace_ppu")]
-                if !trace::structured_enabled() {
-                    eprintln!(
-                        "[CPU] WY  <= {:>3} at ly={}, mode={}",
-                        value,
-                        gpu.ly(),
-                        gpu.mode_code()
-                    );
-                }
-            }
-
-            IO_WX => {
-                Self::trace_io_write(addr, value, gpu);
-                let _old = gpu.get_wx();
-                gpu.set_wx(value);
-                #[cfg(feature = "trace_ppu")]
-                if !trace::structured_enabled() {
-                    eprintln!(
-                        "[CPU] WX  <= {:>3} at ly={}, mode={}",
-                        value,
-                        gpu.ly(),
-                        gpu.mode_code()
-                    );
-                }
-            }
-
-            IO_STAT => {
-                Self::trace_io_write(addr, value, gpu);
-                if gpu.write_stat(value) {
-                    self.set_if_bits(0x02);
-                }
-                #[cfg(feature = "trace_ppu")]
-                if !trace::structured_enabled() {
-                    eprintln!(
-                        "[CPU] STAT <= {:02X} at ly={}, mode={}",
-                        value,
-                        gpu.ly(),
-                        gpu.mode_code()
-                    );
-                }
-            }
-
-            IO_LYC => {
-                Self::trace_io_write(addr, value, gpu);
-                if gpu.write_lyc(value) {
-                    self.set_if_bits(0x02);
-                }
-                #[cfg(feature = "trace_ppu")]
-                if !trace::structured_enabled() {
-                    eprintln!(
-                        "[CPU] LYC <= {:>3} at ly={}, mode={}",
-                        value,
-                        gpu.ly(),
-                        gpu.mode_code()
-                    );
-                }
-            }
-
-            IO_LY => {
-                // DMG behaviour: writing to LY resets it to 0.
-                Self::trace_io_write(addr, value, gpu);
-                if gpu.write_ly(value) {
-                    self.set_if_bits(0x02);
-                }
-            }
-
-            // FF46 — start timed OAM DMA handled by GPU
-            IO_DMA => {
-                Self::trace_io_write(addr, value, gpu);
-                gpu.write_ff46_start_dma(value);
-                // Optional: mirror write for realism
-                self.memory[addr as usize] = value;
+            | IO_LCDC
+            | IO_STAT
+            | IO_LY
+            | IO_LYC
+            | IO_DMA
+            | IO_SCY
+            | IO_SCX
+            | IO_BGP
+            | IO_OBP0
+            | IO_OBP1
+            | IO_WY
+            | IO_WX => {
+                self.write_gpu_reg(addr, value, gpu);
             }
 
             IO_BOOT => {
@@ -376,6 +257,109 @@ impl MMU {
             _ => {
                 self.memory[addr as usize] = value;
             }
+        }
+    }
+
+    /// Handle writes to GPU I/O registers (FF40–FF4B).
+    /// Sets STAT IRQ (IF bit 1) when certain registers trigger it.
+    fn write_gpu_reg(&mut self, addr: u16, value: u8, gpu: &mut GPU) {
+        Self::trace_io_write(addr, value, gpu);
+        match addr {
+            IO_LCDC => {
+                if gpu.set_lcdc(value) {
+                    self.set_if_bits(0x02);
+                }
+            }
+            IO_STAT => {
+                if gpu.write_stat(value) {
+                    self.set_if_bits(0x02);
+                }
+                #[cfg(feature = "trace_ppu")]
+                if !trace::structured_enabled() {
+                    eprintln!(
+                        "[CPU] STAT <= {:02X} at ly={}, mode={}",
+                        value,
+                        gpu.ly(),
+                        gpu.mode_code()
+                    );
+                }
+            }
+            IO_LYC => {
+                if gpu.write_lyc(value) {
+                    self.set_if_bits(0x02);
+                }
+                #[cfg(feature = "trace_ppu")]
+                if !trace::structured_enabled() {
+                    eprintln!(
+                        "[CPU] LYC <= {:>3} at ly={}, mode={}",
+                        value,
+                        gpu.ly(),
+                        gpu.mode_code()
+                    );
+                }
+            }
+            IO_LY => {
+                // DMG behaviour: writing to LY resets it to 0.
+                if gpu.write_ly(value) {
+                    self.set_if_bits(0x02);
+                }
+            }
+            IO_SCY => {
+                gpu.set_scy(value);
+                #[cfg(feature = "trace_ppu")]
+                if !trace::structured_enabled() {
+                    eprintln!(
+                        "[CPU] SCY <= {:>3} at ly={}, mode={}",
+                        value,
+                        gpu.ly(),
+                        gpu.mode_code()
+                    );
+                }
+            }
+            IO_SCX => {
+                gpu.set_scx(value);
+                #[cfg(feature = "trace_ppu")]
+                if !trace::structured_enabled() {
+                    eprintln!(
+                        "[CPU] SCX <= {:>3} at ly={}, mode={}",
+                        value,
+                        gpu.ly(),
+                        gpu.mode_code()
+                    );
+                }
+            }
+            IO_WY => {
+                gpu.set_wy(value);
+                #[cfg(feature = "trace_ppu")]
+                if !trace::structured_enabled() {
+                    eprintln!(
+                        "[CPU] WY  <= {:>3} at ly={}, mode={}",
+                        value,
+                        gpu.ly(),
+                        gpu.mode_code()
+                    );
+                }
+            }
+            IO_WX => {
+                gpu.set_wx(value);
+                #[cfg(feature = "trace_ppu")]
+                if !trace::structured_enabled() {
+                    eprintln!(
+                        "[CPU] WX  <= {:>3} at ly={}, mode={}",
+                        value,
+                        gpu.ly(),
+                        gpu.mode_code()
+                    );
+                }
+            }
+            IO_BGP => gpu.set_bgp(value),
+            IO_OBP0 => gpu.set_obp0(value),
+            IO_OBP1 => gpu.set_obp1(value),
+            IO_DMA => {
+                gpu.write_ff46_start_dma(value);
+                self.memory[addr as usize] = value; // mirror for realism
+            }
+            _ => {}
         }
     }
 }

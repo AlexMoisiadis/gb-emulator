@@ -7,6 +7,7 @@ pub mod ch4;
 pub mod frame_seq;
 pub mod mixer;
 pub mod output;
+pub mod pulse;
 
 use ch1::Ch1;
 use ch2::Ch2;
@@ -347,59 +348,24 @@ impl Apu {
 
     /// Mix and push one stereo sample pair.
     fn emit_sample(&mut self) {
-        // Raw 0–15 output from each channel (0 when disabled / DAC off)
-        let s1 = if self.ch1.enabled() { self.ch1.sample() as f32 } else { 0.0 };
-        let s2 = if self.ch2.enabled() { self.ch2.sample() as f32 } else { 0.0 };
-        let s3 = if self.ch3.enabled() { self.ch3.sample() as f32 } else { 0.0 };
-        let s4 = if self.ch4.enabled() { self.ch4.sample() as f32 } else { 0.0 };
+        // Raw 0–15 output from each channel (0 when disabled / DAC off).
+        let samples: [f32; 4] = [
+            if self.ch1.enabled() { self.ch1.sample() as f32 } else { 0.0 },
+            if self.ch2.enabled() { self.ch2.sample() as f32 } else { 0.0 },
+            if self.ch3.enabled() { self.ch3.sample() as f32 } else { 0.0 },
+            if self.ch4.enabled() { self.ch4.sample() as f32 } else { 0.0 },
+        ];
 
-        // NR51 panning — bit set = channel routed to that speaker
-        let left = mixer::mix(
-            if (self.nr51 & 0x10) != 0 {
-                s1
-            } else {
-                0.0
-            },
-            if (self.nr51 & 0x20) != 0 {
-                s2
-            } else {
-                0.0
-            },
-            if (self.nr51 & 0x40) != 0 {
-                s3
-            } else {
-                0.0
-            },
-            if (self.nr51 & 0x80) != 0 {
-                s4
-            } else {
-                0.0
-            },
-            (self.nr50 >> 4) & 0x07
-        );
-        let right = mixer::mix(
-            if (self.nr51 & 0x01) != 0 {
-                s1
-            } else {
-                0.0
-            },
-            if (self.nr51 & 0x02) != 0 {
-                s2
-            } else {
-                0.0
-            },
-            if (self.nr51 & 0x04) != 0 {
-                s3
-            } else {
-                0.0
-            },
-            if (self.nr51 & 0x08) != 0 {
-                s4
-            } else {
-                0.0
-            },
-            self.nr50 & 0x07
-        );
+        // NR51 panning: left = bits 7–4 (ch4..ch1), right = bits 3–0 (ch4..ch1).
+        const LEFT_BITS:  [u8; 4] = [0x10, 0x20, 0x40, 0x80];
+        const RIGHT_BITS: [u8; 4] = [0x01, 0x02, 0x04, 0x08];
+
+        let nr51 = self.nr51;
+        let left_panned:  [f32; 4] = std::array::from_fn(|i| if (nr51 & LEFT_BITS[i])  != 0 { samples[i] } else { 0.0 });
+        let right_panned: [f32; 4] = std::array::from_fn(|i| if (nr51 & RIGHT_BITS[i]) != 0 { samples[i] } else { 0.0 });
+
+        let left  = mixer::mix(left_panned[0],  left_panned[1],  left_panned[2],  left_panned[3],  (self.nr50 >> 4) & 0x07);
+        let right = mixer::mix(right_panned[0], right_panned[1], right_panned[2], right_panned[3], self.nr50 & 0x07);
 
         self.sample_buffer.push(left);
         self.sample_buffer.push(right);

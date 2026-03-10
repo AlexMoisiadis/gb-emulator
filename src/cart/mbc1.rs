@@ -3,6 +3,12 @@ use anyhow::Result;
 use super::header::CartHeader;
 use super::mapper::Mapper;
 
+const RAM_BANK_SIZE: usize = 0x2000; // 8 KiB external RAM bank
+const LOW5_MASK: u8 = 0x1f; // lower 5 ROM bank bits (0x2000–0x3FFF writes)
+const HI2_MASK: u8 = 0x03; // upper 2 bank bits (0x4000–0x5FFF writes)
+const MODE_MASK: u8 = 0x01; // mode select bit (0x6000–0x7FFF writes)
+const RAM_ENABLE_MAGIC: u8 = 0x0a; // lower nibble value that enables external RAM
+
 pub struct Mbc1 {
     rom: Vec<u8>,
     rom_bank: u8, // low 5 bits from 0x2000..=0x3FFF
@@ -101,14 +107,13 @@ impl Mapper for Mbc1 {
         if !self.ram_enable || self.ram.is_empty() {
             return 0xff;
         }
-        let bank_size = 0x2000;
         let addr = _addr as usize;
         if !(0xa000..=0xbfff).contains(&addr) {
             return 0xff;
         }
         let bank = self.ram_bank();
         let offset = addr - 0xa000;
-        let idx = bank * bank_size + offset;
+        let idx = bank * RAM_BANK_SIZE + offset;
         self.ram.get(idx).copied().unwrap_or(0xff)
     }
 
@@ -116,12 +121,12 @@ impl Mapper for Mbc1 {
         match addr {
             // 0000-1FFF: RAM enable latch.
             0x0000..=0x1fff => {
-                self.ram_enable = (value & 0x0f) == 0x0a;
+                self.ram_enable = (value & 0x0f) == RAM_ENABLE_MAGIC;
             }
 
             // 2000-3FFF: ROM bank low5
             0x2000..=0x3fff => {
-                self.rom_bank = value & 0x1f;
+                self.rom_bank = value & LOW5_MASK;
                 #[cfg(feature = "debug_timing")]
                 eprintln!(
                     "[MBC1] set low5={:02X} -> high_bank={}",
@@ -132,7 +137,7 @@ impl Mapper for Mbc1 {
 
             // 4000-5FFF: bank hi2 (ROM upper bits in mode 0, low-window bank in mode 1)
             0x4000..=0x5fff => {
-                self.bank_hi2 = value & 0x03;
+                self.bank_hi2 = value & HI2_MASK;
                 #[cfg(feature = "debug_timing")]
                 eprintln!(
                     "[MBC1] set hi2={:02X} -> low_bank={} high_bank={}",
@@ -144,7 +149,7 @@ impl Mapper for Mbc1 {
 
             // 6000-7FFF: mode select (0=ROM banking, 1=RAM banking)
             0x6000..=0x7fff => {
-                self.mode_rom = (value & 0x01) == 0;
+                self.mode_rom = (value & MODE_MASK) == 0;
                 #[cfg(feature = "debug_timing")]
                 eprintln!("[MBC1] mode set: ROM={}.", self.mode_rom);
             }
@@ -155,7 +160,7 @@ impl Mapper for Mbc1 {
                     return;
                 }
                 let bank = self.ram_bank();
-                let idx = bank * 0x2000 + ((addr as usize) - 0xa000);
+                let idx = bank * RAM_BANK_SIZE + ((addr as usize) - 0xa000);
                 if let Some(slot) = self.ram.get_mut(idx) {
                     *slot = value;
                 }

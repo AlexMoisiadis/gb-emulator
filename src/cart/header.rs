@@ -1,5 +1,10 @@
 use anyhow::{ bail, Result };
 
+const CART_TYPE_OFFSET: usize = 0x0147;
+const ROM_SIZE_OFFSET: usize = 0x0148;
+const RAM_SIZE_OFFSET: usize = 0x0149;
+const HEADER_MIN_LEN: usize = 0x0150;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapperKind {
     None, // 0x00
@@ -18,13 +23,13 @@ pub struct CartHeader {
 }
 
 pub fn parse_header(rom: &[u8]) -> Result<CartHeader> {
-    if rom.len() < 0x0150 {
+    if rom.len() < HEADER_MIN_LEN {
         bail!("ROM too small to contain header");
     }
     Ok(CartHeader {
-        cart_type: rom[0x0147],
-        rom_size: rom[0x0148],
-        ram_size: rom[0x0149],
+        cart_type: rom[CART_TYPE_OFFSET],
+        rom_size: rom[ROM_SIZE_OFFSET],
+        ram_size: rom[RAM_SIZE_OFFSET],
     })
 }
 

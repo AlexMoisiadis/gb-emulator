@@ -2,11 +2,10 @@
 use gb_emulator::gpu::DebugOverlayConfig;
 use gb_emulator::{ CPU, MemoryBus };
 use gb_emulator::input::joypad::Button;
+use gb_emulator::util::{ dmg_shade_to_u8, save_png };
 
 use anyhow::Result;
 use pixels::{ Pixels, SurfaceTexture };
-use png::{ BitDepth, ColorType, Encoder };
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{ Duration, Instant };
@@ -31,16 +30,6 @@ const DMG_CLOCK_HZ: u32 = 4_194_304;
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 const FRAME_NS: u128 = (NANOS_PER_SEC * (DMG_DOTS_PER_FRAME as u128)) / (DMG_CLOCK_HZ as u128);
 const FRAME_DT: Duration = Duration::from_nanos(FRAME_NS as u64);
-
-#[inline]
-fn dmg_shade_to_u8(v: u8) -> u8 {
-    match v & 0b11 {
-        0 => 255,
-        1 => 170,
-        2 => 85,
-        _ => 0,
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunState {
@@ -105,6 +94,26 @@ impl ViewerConfig {
     }
 }
 
+/// Toggled via G/W/A/S hotkeys; drives DebugOverlayConfig on every change.
+#[derive(Debug, Clone, Copy, Default)]
+struct OverlayToggles {
+    grid: bool,
+    window: bool,
+    axes: bool,
+    sprites: bool,
+}
+
+/// Frame and screenshot counters for the viewer's capture system.
+#[derive(Debug, Clone, Copy, Default)]
+struct CaptureState {
+    /// Counter for manual F9 screenshots.
+    screenshot_id: u32,
+    /// Total frames emulated (used for capture_skip logic).
+    frame_count: u32,
+    /// Number of automatic captures taken so far.
+    captured_so_far: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ViewerStats {
     emulated_frames: u64,
@@ -165,18 +174,8 @@ struct App {
     redraw_requested: bool,
     pending_present: Option<PendingPresent>,
 
-    // Overlays
-    o_grid: bool,
-    o_window: bool,
-    o_axes: bool,
-    o_sprites: bool,
-
-    // Screenshots
-    screenshot_id: u32,
-
-    // Capture counters
-    frame_count: u32,
-    captured_so_far: u32,
+    overlays: OverlayToggles,
+    capture: CaptureState,
 }
 
 impl App {
@@ -187,13 +186,10 @@ impl App {
         let mut bus = Box::new(MemoryBus::new());
         post_boot_init(&mut cpu, &mut bus);
 
-        // Overlays default; toggle via hotkeys
-        let (o_grid, o_window, o_axes, o_sprites) = (false, false, false, false);
-
         // Load ROM
         let rom = std::fs::read(rom_path)?;
         bus.load_rom(&rom);
-        apply_overlay(&mut bus, o_grid, o_window, o_axes, o_sprites);
+        apply_overlay(&mut bus, &OverlayToggles::default());
 
         let run_state = if config.pause_on_start { RunState::Paused } else { RunState::Running };
         let initial_deadline = Instant::now() + config.frame_dt;
@@ -210,13 +206,8 @@ impl App {
             next_deadline: initial_deadline,
             redraw_requested: false,
             pending_present: None,
-            o_grid,
-            o_window,
-            o_axes,
-            o_sprites,
-            screenshot_id: 0,
-            frame_count: 0,
-            captured_so_far: 0,
+            overlays: OverlayToggles::default(),
+            capture: CaptureState::default(),
         })
     }
 
@@ -226,19 +217,7 @@ impl App {
     }
 
     fn save_png<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let mut gray = vec![0u8; W * H];
-        for y in 0..H {
-            for x in 0..W {
-                gray[y * W + x] = dmg_shade_to_u8(self.fb[y][x]);
-            }
-        }
-        let file = File::create(path.as_ref())?;
-        let mut enc = Encoder::new(file, W as u32, H as u32);
-        enc.set_color(ColorType::Grayscale);
-        enc.set_depth(BitDepth::Eight);
-        let mut writer = enc.write_header()?;
-        writer.write_image_data(&gray)?;
-        Ok(())
+        save_png(&self.fb, path)
     }
 
     fn update_control_flow(&self, event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -303,6 +282,10 @@ impl App {
                     RunState::ExitRequested => RunState::ExitRequested,
                 };
             }
+            PhysicalKey::Code(KeyCode::KeyM) => {
+                let muted = self.bus.toggle_mute();
+                eprintln!("Audio {}", if muted { "muted" } else { "unmuted" });
+            }
             PhysicalKey::Code(KeyCode::KeyN) => {
                 if self.run_state == RunState::Paused {
                     self.run_state = RunState::StepOneFrame;
@@ -313,24 +296,24 @@ impl App {
                 self.next_deadline = Instant::now() + self.config.frame_dt;
             }
             PhysicalKey::Code(KeyCode::KeyG) => {
-                self.o_grid = !self.o_grid;
+                self.overlays.grid = !self.overlays.grid;
                 overlay_changed = true;
             }
             PhysicalKey::Code(KeyCode::KeyW) => {
-                self.o_window = !self.o_window;
+                self.overlays.window = !self.overlays.window;
                 overlay_changed = true;
             }
             PhysicalKey::Code(KeyCode::KeyA) => {
-                self.o_axes = !self.o_axes;
+                self.overlays.axes = !self.overlays.axes;
                 overlay_changed = true;
             }
             PhysicalKey::Code(KeyCode::KeyS) => {
-                self.o_sprites = !self.o_sprites;
+                self.overlays.sprites = !self.overlays.sprites;
                 overlay_changed = true;
             }
             PhysicalKey::Code(KeyCode::F9) => {
-                self.screenshot_id = self.screenshot_id.wrapping_add(1);
-                let filename = format!("acid2-capture-{:03}.png", self.screenshot_id);
+                self.capture.screenshot_id = self.capture.screenshot_id.wrapping_add(1);
+                let filename = format!("acid2-capture-{:03}.png", self.capture.screenshot_id);
                 match self.save_png(&filename) {
                     Ok(()) => eprintln!("Saved {}", filename),
                     Err(e) => eprintln!("Save failed: {e}"),
@@ -344,7 +327,7 @@ impl App {
         }
 
         if overlay_changed {
-            apply_overlay(&mut self.bus, self.o_grid, self.o_window, self.o_axes, self.o_sprites);
+            apply_overlay(&mut self.bus, &self.overlays);
         }
     }
 
@@ -355,21 +338,21 @@ impl App {
         ly_ready: u8,
         mode_ready: u8
     ) -> CaptureDecision {
-        if self.frame_count <= self.config.capture_skip {
+        if self.capture.frame_count <= self.config.capture_skip {
             return CaptureDecision::SkippedBeforeWindow;
         }
-        if self.captured_so_far >= self.config.capture_first_n {
+        if self.capture.captured_so_far >= self.config.capture_first_n {
             return CaptureDecision::SkippedQuotaReached;
         }
         if self.config.capture_require_lcd_on && (lcdc & 0x80) == 0 {
             return CaptureDecision::SkippedLcdOff;
         }
 
-        let idx = self.captured_so_far + 1;
+        let idx = self.capture.captured_so_far + 1;
         let filename = format!("{}-{:03}.png", self.config.capture_prefix, idx);
         match self.save_png(&filename) {
             Ok(()) => {
-                self.captured_so_far = self.captured_so_far.saturating_add(1);
+                self.capture.captured_so_far = self.capture.captured_so_far.saturating_add(1);
                 if self.config.trace_structured {
                     eprintln!(
                         "[TRACE] capture frame={} file={} lcdc={:02X} ly={} mode={}",
@@ -398,7 +381,7 @@ impl App {
         self.stats.last_emu_time = emu_start.elapsed();
 
         if self.bus.gpu.take_frame_ready() {
-            self.frame_count = self.frame_count.saturating_add(1);
+            self.capture.frame_count = self.capture.frame_count.saturating_add(1);
             self.bus.gpu.copy_frame(&mut self.fb);
 
             let ly_ready = self.bus.gpu.ly();
@@ -408,7 +391,7 @@ impl App {
             let frame_index = self.bus.gpu
                 .take_last_frame_telemetry()
                 .map(|t| t.frame_index)
-                .unwrap_or(self.frame_count as u64);
+                .unwrap_or(self.capture.frame_count as u64);
 
             let decision = self.capture_if_requested(frame_index, lcdc, ly_ready, mode_ready);
             if !self.config.trace_structured {
@@ -623,12 +606,12 @@ fn main() -> Result<()> {
 }
 
 // ----- helpers -----
-fn apply_overlay(bus: &mut MemoryBus, grid: bool, window: bool, axes: bool, sprites: bool) {
+fn apply_overlay(bus: &mut MemoryBus, overlays: &OverlayToggles) {
     let mut cfg = DebugOverlayConfig::default();
-    cfg.show_bg_tile_grid = grid;
-    cfg.show_window_bounds = window;
-    cfg.show_bg_axes = axes;
-    cfg.show_sprite_boxes = sprites;
+    cfg.show_bg_tile_grid = overlays.grid;
+    cfg.show_window_bounds = overlays.window;
+    cfg.show_bg_axes = overlays.axes;
+    cfg.show_sprite_boxes = overlays.sprites;
     cfg.shade_grid = 1;
     cfg.shade_window = 1;
     cfg.shade_axes = 1;

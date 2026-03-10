@@ -90,6 +90,16 @@ pub trait DmaRead {
     fn read8(&mut self, addr: u16) -> u8;
 }
 
+/// All state for the OAM DMA transfer (FF46).
+struct DmaState {
+    active: bool,
+    src_high: u8, // high byte of source address (source = src_high << 8)
+    byte_idx: u16, // next byte to copy (0..160)
+    mcycles_left: u16,
+    start_delay_tcycles: u8, // T-cycle delay before first copy tick
+    tcycle_phase: u8,
+}
+
 pub struct GPU {
     // VRAM + tile cache
     vram: [u8; VRAM_SIZE],
@@ -119,7 +129,7 @@ pub struct GPU {
 
     // PPU state
     mode: PpuMode,
-    dot_in_mode: u16, // 0..=455 across a line (we clamp per-mode)
+    mode_dot: u16, // dot position within current mode (0-based)
     ly: u8,
     frame_ready: bool,
     framebuf: [[u8; LCD_WIDTH]; LCD_HEIGHT],
@@ -127,21 +137,17 @@ pub struct GPU {
     lyc: u8,
 
     // OAM DMA (FF46)
-    dma_active: bool,
-    dma_src_high: u8,
-    dma_byte_idx: u16,
-    dma_mcycles_left: u16,
-    dma_start_delay_tcycles: u8,
-    dma_tcycle_phase: u8,
+    dma: DmaState,
 
     // For Mode 3 length (DMG nominal, kept constant here)
     sprites_on_line_count: u8,
     stat_irq_line_prev: bool,
-    stat_mode0_pre_transition: bool,
+    /// Raise STAT IRQ one dot before the actual HBlank transition (DMG quirk).
+    hblank_irq_early: bool,
 
     // Window latches
-    wy_latched_this_line: bool,
-    wx_latched_for_line: u8,
+    wy_triggered: bool, // true when window Y condition was met this frame
+    wx_latched: u8, // latched WX value for the current scanline
     frame_index: u64,
     ly_wraps: u64,
     mode_switches: [u32; 4],
@@ -211,23 +217,25 @@ impl GPU {
             window_line_counter: 0,
             debug: DebugOverlayConfig::default(),
             mode: PpuMode::Oam2,
-            dot_in_mode: 0,
+            mode_dot: 0,
             ly: 0,
             frame_ready: false,
             framebuf: [[0; LCD_WIDTH]; LCD_HEIGHT],
             stat: 0,
             lyc: 0,
-            dma_active: false,
-            dma_src_high: 0,
-            dma_byte_idx: 0,
-            dma_mcycles_left: 0,
-            dma_start_delay_tcycles: 0,
-            dma_tcycle_phase: 0,
+            dma: DmaState {
+                active: false,
+                src_high: 0,
+                byte_idx: 0,
+                mcycles_left: 0,
+                start_delay_tcycles: 0,
+                tcycle_phase: 0,
+            },
             sprites_on_line_count: 0,
             stat_irq_line_prev: false,
-            stat_mode0_pre_transition: false,
-            wy_latched_this_line: false,
-            wx_latched_for_line: 0,
+            hblank_irq_early: false,
+            wy_triggered: false,
+            wx_latched: 0,
             frame_index: 0,
             ly_wraps: 0,
             mode_switches: [0; 4],
@@ -251,7 +259,7 @@ impl GPU {
         let lyc_src = (self.stat & (1 << 6)) != 0 && self.ly == self.lyc;
         let m0_src =
             (self.stat & (1 << 3)) != 0 &&
-            (matches!(self.mode, PpuMode::HBlank0) || self.stat_mode0_pre_transition);
+            (matches!(self.mode, PpuMode::HBlank0) || self.hblank_irq_early);
         let m1_src = (self.stat & (1 << 4)) != 0 && matches!(self.mode, PpuMode::VBlank1);
         let m2_src = (self.stat & (1 << 5)) != 0 && matches!(self.mode, PpuMode::Oam2);
         (m0_src, m1_src, m2_src, lyc_src)
@@ -319,14 +327,14 @@ impl GPU {
 
     pub fn begin_frame(&mut self) {
         self.window_line_counter = 0;
-        self.wy_latched_this_line = false;
+        self.wy_triggered = false;
     }
 
     // --------- register-ish API ----------
     pub fn write_lyc(&mut self, v: u8) -> bool {
         self.lyc = v;
         self.update_ly_and_lyc();
-        self.stat_mode0_pre_transition = false;
+        self.hblank_irq_early = false;
         self.drive_stat_line_edge()
     }
     #[inline]
@@ -336,7 +344,7 @@ impl GPU {
     #[inline]
     pub fn write_stat(&mut self, v: u8) -> bool {
         self.stat = (self.stat & 0x07) | (v & 0x78);
-        self.stat_mode0_pre_transition = false;
+        self.hblank_irq_early = false;
         self.drive_stat_line_edge()
     }
     #[inline]
@@ -432,34 +440,34 @@ impl GPU {
             (true, false) => {
                 // LCD OFF: LY resets and PPU idles in mode 0.
                 self.mode = PpuMode::HBlank0;
-                self.dot_in_mode = 0;
+                self.mode_dot = 0;
                 self.mode3_len_latched = MODE3_BASE_DOTS;
                 self.hblank_len_latched = LINE_DOTS - MODE2_OAM_DOTS - MODE3_BASE_DOTS;
                 self.ly = 0;
                 self.window_line_counter = 0;
-                self.wy_latched_this_line = false;
-                self.wx_latched_for_line = self.wx;
+                self.wy_triggered = false;
+                self.wx_latched = self.wx;
                 self.frame_ready = false;
                 self.stat = (self.stat & !0x07) | PpuMode::HBlank0.stat_bits();
                 self.stat_irq_line_prev = false;
-                self.stat_mode0_pre_transition = false;
+                self.hblank_irq_early = false;
             }
             (false, true) => {
                 // LCD ON: restart scanning from LY=0 in mode 2.
                 self.mode = PpuMode::Oam2;
-                self.dot_in_mode = 0;
+                self.mode_dot = 0;
                 self.latch_visible_line_timing();
                 self.ly = 0;
                 self.window_line_counter = 0;
-                self.wy_latched_this_line = (self.lcdc & 0x20) != 0 && self.ly == self.wy;
-                self.wx_latched_for_line = self.wx;
+                self.wy_triggered = (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+                self.wx_latched = self.wx;
                 self.stat = (self.stat & !0x03) | PpuMode::Oam2.stat_bits();
                 if self.ly == self.lyc {
                     self.stat |= 1 << 2;
                 } else {
                     self.stat &= !(1 << 2);
                 }
-                self.stat_mode0_pre_transition = false;
+                self.hblank_irq_early = false;
                 stat_edge = self.drive_stat_line_edge();
             }
             _ => {}
@@ -470,7 +478,7 @@ impl GPU {
     pub fn write_ly(&mut self, _v: u8) -> bool {
         self.ly = 0;
         self.update_ly_and_lyc();
-        self.stat_mode0_pre_transition = false;
+        self.hblank_irq_early = false;
         self.drive_stat_line_edge()
     }
     #[inline]
@@ -568,13 +576,13 @@ impl GPU {
 
             // 1 byte per M-cycle during OAM DMA
             self.step_oam_dma(dma);
-            self.stat_mode0_pre_transition = false;
+            self.hblank_irq_early = false;
 
             match self.mode {
                 PpuMode::HBlank0 => {
-                    self.dot_in_mode = self.dot_in_mode.saturating_add(1);
-                    if self.dot_in_mode >= self.hblank_len_latched {
-                        self.dot_in_mode = 0;
+                    self.mode_dot = self.mode_dot.saturating_add(1);
+                    if self.mode_dot >= self.hblank_len_latched {
+                        self.mode_dot = 0;
                         // End of scanline: advance LY and decide next mode
                         self.ly = self.ly.wrapping_add(1);
 
@@ -643,7 +651,7 @@ impl GPU {
                             self.mode = PpuMode::Oam2;
                             // WY latch for the new line: window enabled AND WY == current LY
                             if (self.lcdc & 0x20) != 0 && self.ly == self.wy {
-                                self.wy_latched_this_line = true;
+                                self.wy_triggered = true;
                             }
                             self.set_stat_mode(PpuMode::Oam2);
                             self.update_ly_and_lyc();
@@ -653,8 +661,7 @@ impl GPU {
                             self.ly_wraps = self.ly_wraps.saturating_add(1);
                             self.window_line_counter = 0;
                             self.mode = PpuMode::Oam2;
-                            self.wy_latched_this_line =
-                                (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+                            self.wy_triggered = (self.lcdc & 0x20) != 0 && self.ly == self.wy;
                             self.set_stat_mode(PpuMode::Oam2);
                             self.update_ly_and_lyc();
                         }
@@ -662,9 +669,9 @@ impl GPU {
                 }
 
                 PpuMode::VBlank1 => {
-                    self.dot_in_mode = self.dot_in_mode.saturating_add(1);
-                    if self.dot_in_mode >= LINE_DOTS {
-                        self.dot_in_mode = 0;
+                    self.mode_dot = self.mode_dot.saturating_add(1);
+                    if self.mode_dot >= LINE_DOTS {
+                        self.mode_dot = 0;
                         self.ly = self.ly.wrapping_add(1);
                         if self.ly > 153 {
                             // Leave VBlank -> begin new frame at LY=0
@@ -672,8 +679,7 @@ impl GPU {
                             self.ly_wraps = self.ly_wraps.saturating_add(1);
                             self.window_line_counter = 0;
                             self.mode = PpuMode::Oam2;
-                            self.wy_latched_this_line =
-                                (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+                            self.wy_triggered = (self.lcdc & 0x20) != 0 && self.ly == self.wy;
                             self.set_stat_mode(PpuMode::Oam2);
                             self.update_ly_and_lyc();
                         } else {
@@ -684,14 +690,14 @@ impl GPU {
                 }
 
                 PpuMode::Oam2 => {
-                    self.dot_in_mode = self.dot_in_mode.saturating_add(1);
-                    if self.dot_in_mode >= MODE2_OAM_DOTS {
+                    self.mode_dot = self.mode_dot.saturating_add(1);
+                    if self.mode_dot >= MODE2_OAM_DOTS {
                         // Enter Mode 3 exactly once per visible line
-                        self.dot_in_mode = 0;
+                        self.mode_dot = 0;
                         self.mode = PpuMode::Xfer3;
 
                         // WX latch for this line at Mode 3 start
-                        self.wx_latched_for_line = self.wx;
+                        self.wx_latched = self.wx;
                         self.set_stat_mode(PpuMode::Xfer3);
 
                         // Count sprites overlapping this line
@@ -701,14 +707,14 @@ impl GPU {
                 }
 
                 PpuMode::Xfer3 => {
-                    if self.dot_in_mode.saturating_add(1) >= self.mode3_len_latched {
+                    if self.mode_dot.saturating_add(1) >= self.mode3_len_latched {
                         // DMG nuance: mode-0 STAT source goes high one dot
                         // before the mode 3 -> mode 0 transition.
-                        self.stat_mode0_pre_transition = true;
+                        self.hblank_irq_early = true;
                         self.maybe_raise_stat_irq(&mut events);
                     }
-                    self.dot_in_mode = self.dot_in_mode.saturating_add(1);
-                    if self.dot_in_mode >= self.mode3_len_latched {
+                    self.mode_dot = self.mode_dot.saturating_add(1);
+                    if self.mode_dot >= self.mode3_len_latched {
                         // Render at mode-3 completion (just before entering HBlank).
                         let ly = self.ly;
                         let mut line = [0u8; LCD_WIDTH];
@@ -717,7 +723,7 @@ impl GPU {
                         self.overlay_debug_scanline(ly, &mut line);
                         self.framebuf[ly as usize] = line;
 
-                        self.dot_in_mode = 0;
+                        self.mode_dot = 0;
                         self.mode = PpuMode::HBlank0;
                         self.set_stat_mode(PpuMode::HBlank0);
                     }
@@ -725,7 +731,7 @@ impl GPU {
             }
 
             // Checkpoint B: evaluate normal STAT sources after state updates.
-            self.stat_mode0_pre_transition = false;
+            self.hblank_irq_early = false;
             self.maybe_raise_stat_irq(&mut events);
         }
 
@@ -733,36 +739,36 @@ impl GPU {
     }
 
     fn step_oam_dma<D: DmaRead>(&mut self, dma: &mut D) {
-        if !self.dma_active {
+        if !self.dma.active {
             return;
         }
-        if self.dma_start_delay_tcycles > 0 {
-            self.dma_start_delay_tcycles -= 1;
+        if self.dma.start_delay_tcycles > 0 {
+            self.dma.start_delay_tcycles -= 1;
             return;
         }
-        self.dma_tcycle_phase = self.dma_tcycle_phase.wrapping_add(1);
-        if self.dma_tcycle_phase < 4 {
+        self.dma.tcycle_phase = self.dma.tcycle_phase.wrapping_add(1);
+        if self.dma.tcycle_phase < 4 {
             return;
         }
-        self.dma_tcycle_phase = 0;
-        if self.dma_mcycles_left == 0 || self.dma_byte_idx >= 160 {
-            self.dma_active = false;
+        self.dma.tcycle_phase = 0;
+        if self.dma.mcycles_left == 0 || self.dma.byte_idx >= 160 {
+            self.dma.active = false;
             return;
         }
-        self.dma_mcycles_left -= 1;
+        self.dma.mcycles_left -= 1;
 
-        if self.dma_byte_idx < 160 {
-            let src = ((self.dma_src_high as u16) << 8) | self.dma_byte_idx;
+        if self.dma.byte_idx < 160 {
+            let src = ((self.dma.src_high as u16) << 8) | self.dma.byte_idx;
             let val = dma.read8(src);
-            let dst_index = self.dma_byte_idx as usize;
+            let dst_index = self.dma.byte_idx as usize;
             if dst_index < self.oam.len() {
                 self.oam[dst_index] = val;
             }
-            self.dma_byte_idx += 1;
+            self.dma.byte_idx += 1;
         }
 
-        if self.dma_byte_idx >= 160 {
-            self.dma_active = false;
+        if self.dma.byte_idx >= 160 {
+            self.dma.active = false;
         }
     }
 
@@ -873,8 +879,8 @@ impl GPU {
         let win_on = (self.lcdc & 0x20) != 0;
 
         // Latches: WY in Mode 2; WX at Mode 3 start.
-        let win_left_latched = self.wx_latched_for_line.wrapping_sub(7);
-        let window_vert_active = win_on && self.wy_latched_this_line;
+        let win_left_latched = self.wx_latched.wrapping_sub(7);
+        let window_vert_active = win_on && self.wy_triggered;
 
         let use_8000 = (self.lcdc & 0x10) != 0;
 
@@ -1009,9 +1015,9 @@ impl GPU {
         }
 
         // 3) Pick first non-zero OBJ pixel per x, then apply BG-over-OBJ
-        let mut cand_idx: [u8; LCD_WIDTH] = [0; LCD_WIDTH];
-        let mut cand_obp1: [bool; LCD_WIDTH] = [false; LCD_WIDTH];
-        let mut cand_bgbit: [bool; LCD_WIDTH] = [false; LCD_WIDTH];
+        let mut sprite_pixel: [u8; LCD_WIDTH] = [0; LCD_WIDTH];
+        let mut sprite_palette: [bool; LCD_WIDTH] = [false; LCD_WIDTH];
+        let mut sprite_behind_bg: [bool; LCD_WIDTH] = [false; LCD_WIDTH];
 
         for si in 0..count {
             let (i, _) = order[si];
@@ -1055,7 +1061,7 @@ impl GPU {
                     continue;
                 }
                 let sx = sx_i16 as usize;
-                if cand_idx[sx] != 0 {
+                if sprite_pixel[sx] != 0 {
                     continue;
                 }
 
@@ -1070,21 +1076,21 @@ impl GPU {
                     continue;
                 }
 
-                cand_idx[sx] = obj_idx;
-                cand_obp1[sx] = use_obp1;
-                cand_bgbit[sx] = behind_bg;
+                sprite_pixel[sx] = obj_idx;
+                sprite_palette[sx] = use_obp1;
+                sprite_behind_bg[sx] = behind_bg;
             }
         }
 
         for x in 0..LCD_WIDTH {
-            let idx = cand_idx[x];
+            let idx = sprite_pixel[x];
             if idx == 0 {
                 continue;
             }
-            if cand_bgbit[x] && self.bg_idx_line[x] != 0 {
+            if sprite_behind_bg[x] && self.bg_idx_line[x] != 0 {
                 continue;
             }
-            out[x] = self.map_obp(idx, cand_obp1[x]);
+            out[x] = self.map_obp(idx, sprite_palette[x]);
         }
     }
 
@@ -1230,17 +1236,17 @@ impl GPU {
 
     // --------------- OAM DMA public API (FF46) ----------------
     pub fn write_ff46_start_dma(&mut self, v: u8) {
-        self.dma_active = true;
-        self.dma_src_high = v;
-        self.dma_byte_idx = 0;
-        self.dma_mcycles_left = 160; // 160 M-cycles (normal speed)
-        self.dma_start_delay_tcycles = 4; // one M-cycle startup delay
-        self.dma_tcycle_phase = 0;
+        self.dma.active = true;
+        self.dma.src_high = v;
+        self.dma.byte_idx = 0;
+        self.dma.mcycles_left = 160; // 160 M-cycles (normal speed)
+        self.dma.start_delay_tcycles = 4; // one M-cycle startup delay
+        self.dma.tcycle_phase = 0;
     }
 
     #[inline]
     pub fn dma_in_progress(&self) -> bool {
-        self.dma_active
+        self.dma.active
     }
 }
 
@@ -1278,7 +1284,7 @@ mod tests {
 
         gpu.mode = PpuMode::Xfer3;
         gpu.set_stat_mode(PpuMode::Xfer3);
-        gpu.dot_in_mode = gpu.mode3_len_latched.saturating_sub(1);
+        gpu.mode_dot = gpu.mode3_len_latched.saturating_sub(1);
         gpu.write_stat(1 << 3); // Enable mode-0 STAT source only.
         gpu.stat_irq_line_prev = false;
 
