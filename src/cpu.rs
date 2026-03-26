@@ -63,6 +63,7 @@ pub struct CPU {
     trace: bool,
     last_pc: u16,
     last_op: u8,
+    timer_consumed: u32,
 
     // --- NEW: low-noise debug snapshots (only used when debug_timing is on) ---
     #[cfg(feature = "debug_timing")]
@@ -91,6 +92,7 @@ impl CPU {
             trace: false,
             last_pc: 0,
             last_op: 0,
+            timer_consumed: 0,
 
             // --- NEW ---
             #[cfg(feature = "debug_timing")]
@@ -248,6 +250,7 @@ impl CPU {
             PrefixTarget::A => self.regs.a,
             PrefixTarget::HL => {
                 let addr = self.regs.get_hl();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.read_byte(addr)
             }
         }
@@ -279,6 +282,7 @@ impl CPU {
             }
             PrefixTarget::HL => {
                 let addr = self.regs.get_hl();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, val);
             }
         }
@@ -404,12 +408,6 @@ impl CPU {
         (ie, iflag)
     }
 
-    #[inline]
-    fn pending_interrupt_mask(bus: &mut MemoryBus) -> u8 {
-        let (ie, iflag) = Self::read_ie_if(bus);
-        ie & iflag
-    }
-
     fn any_pending_interrupt(&self, bus: &mut MemoryBus) -> bool {
         let (ie, iflag) = Self::read_ie_if(bus);
         (ie & iflag) != 0
@@ -437,6 +435,9 @@ impl CPU {
     pub fn step(&mut self, bus: &mut MemoryBus) -> u32 {
         self.step_index = self.step_index.saturating_add(1);
         trace::set_step(self.step_index);
+        self.timer_consumed = 0;
+        bus.instruction_tcycles = 0;
+        bus.lcd_enable_offset = u32::MAX;
 
         // --- EI delayed-IME semantics ----------------------------------------
         // If EI was executed previously, IME must become 1 *after* the next
@@ -451,9 +452,11 @@ impl CPU {
         // 1) Execute one instruction and get the cycles it consumed
         let mut total_tcycles: u32 = self.execute_one(bus);
 
-        // 2) Advance PPU by the same amount and surface its events into IF now
+        // 2) Advance PPU by the same amount and surface its events into IF now.
+        // Timer was already partially advanced per-M-cycle during execute_one();
+        // only service the remaining T-cycles here to avoid double-counting.
         bus.service_gpu(total_tcycles);
-        bus.service_timer(total_tcycles);
+        bus.service_timer(total_tcycles.saturating_sub(self.timer_consumed));
         bus.service_apu(total_tcycles);
         bus.service_input();
 
@@ -553,7 +556,9 @@ impl CPU {
         const IF_ADDR: u16 = 0xff0f;
 
         let ie = bus.read_byte(IE_ADDR);
+        bus.instruction_tcycles += 4;
         let mut iflag = bus.read_byte(IF_ADDR);
+        bus.instruction_tcycles += 4;
         let pending = ie & iflag;
         if pending == 0 {
             return false;
@@ -587,19 +592,25 @@ impl CPU {
         // Clear the IF bit we are servicing
         iflag &= !(1 << bit);
         bus.write_byte(IF_ADDR, iflag);
+        bus.instruction_tcycles += 4;
 
         // Disable IME
         self.ime = false;
         self.halted = false;
         self.halt_bug_armed = false;
 
-        // Push PC to stack (little endian)
+        // Push PC to stack (little endian).
+        // Each SP decrement is an IDU operation — triggers OAM corruption if in range.
         let hi = ((self.pc >> 8) & 0xff) as u8;
         let lo = (self.pc & 0xff) as u8;
+        bus.idu_oam_corrupt(self.sp);
         self.sp = self.sp.wrapping_sub(1);
         bus.write_byte(self.sp, hi);
+        bus.instruction_tcycles += 4;
+        bus.idu_oam_corrupt(self.sp);
         self.sp = self.sp.wrapping_sub(1);
         bus.write_byte(self.sp, lo);
+        bus.instruction_tcycles += 4;
 
         // Jump to vector
         self.pc = vector;
@@ -614,14 +625,9 @@ impl CPU {
 
     #[inline]
     fn execute_one(&mut self, bus: &mut MemoryBus) -> u32 {
-        // HALT handling: burn cycles or wake, including HALT bug
+        // HALT handling: burn 4 T-cycles. Wake detection is handled in step()
+        // after peripheral advance, matching hardware M-cycle-boundary timing.
         if self.halted {
-            if Self::pending_interrupt_mask(bus) != 0 {
-                self.halted = false;
-                self.trace_cpu_halt_state(bus);
-            }
-            // Always return 4 for any HALT cycle — whether spinning or waking.
-            // The next call to step() will execute the actual next instruction.
             return 4;
         }
 
@@ -661,7 +667,9 @@ impl CPU {
 
     fn fetch8(&mut self, bus: &mut MemoryBus) -> u8 {
         let addr = self.pc;
-        let value = bus.read_byte(addr);
+        // PC increment is an IDU operation; if PC is in OAM range during mode 2,
+        // the combined read+IDU produces Read-During-Inc/Dec corruption.
+        let value = bus.oam_read_during_inc(addr);
 
         // HALT bug: suppress PC increment exactly once.
         if self.halt_bug_armed {
@@ -669,6 +677,11 @@ impl CPU {
         } else {
             self.pc = self.pc.wrapping_add(1);
         }
+
+        // Each fetch8 is one M-cycle (4 T-cycles); advance the timer now so
+        // mid-instruction TIMA reads reflect the correct in-progress state.
+        bus.service_timer(4);
+        self.timer_consumed += 4; bus.instruction_tcycles += 4;
 
         value
     }
@@ -682,18 +695,31 @@ impl CPU {
     }
 
     fn push16(&mut self, bus: &mut MemoryBus, value: u16) {
-        // DMG push: pre-decrement then write hi, pre-decrement then write lo
+        // DMG push: pre-decrement then write hi, pre-decrement then write lo.
+        // Each SP decrement is an IDU operation; if SP is in OAM range, it
+        // triggers IDU Write Corruption before the actual write.
+        bus.idu_oam_corrupt(self.sp);
         self.sp = self.sp.wrapping_sub(1);
         bus.write_byte(self.sp, (value >> 8) as u8);
+        bus.instruction_tcycles += 4;
+        bus.idu_oam_corrupt(self.sp);
         self.sp = self.sp.wrapping_sub(1);
         bus.write_byte(self.sp, (value & 0x00ff) as u8);
+        bus.instruction_tcycles += 4;
     }
 
     fn pop16(&mut self, bus: &mut MemoryBus) -> u16 {
-        // Pop: read lo then hi, post-increment SP each read
+        // Pop: read lo then hi, post-increment SP each read.
+        // Hardware quirk: POP triggers only 3 times instead of the expected 4:
+        // "one read, one glitched write, and another read without a glitched write."
+        // The first SP++ fires IDU Write Corruption; the second SP++ does NOT.
         let lo = bus.read_byte(self.sp) as u16;
+        bus.idu_oam_corrupt(self.sp);
+        bus.instruction_tcycles += 4;
         self.sp = self.sp.wrapping_add(1);
         let hi = bus.read_byte(self.sp) as u16;
+        bus.instruction_tcycles += 4;
+        // Second SP++ IDU is suppressed per hardware behaviour.
         self.sp = self.sp.wrapping_add(1);
         (hi << 8) | lo
     }
@@ -825,34 +851,38 @@ impl CPU {
             }
             LoadByteTarget::MemReg16(Reg16::HL) => {
                 let addr = self.regs.get_hl();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, val);
             }
             LoadByteTarget::MemReg16(Reg16::BC) => {
                 let addr = self.regs.get_bc();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, val);
             }
             LoadByteTarget::MemReg16(Reg16::DE) => {
                 let addr = self.regs.get_de();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, val);
             }
             LoadByteTarget::MemImm16 => {
                 let addr = self.fetch16(bus);
-                // OLD: bus.write_byte(addr, val);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.write_byte_with_ff50_log(bus, addr, val);
             }
             LoadByteTarget::MemImm8 => {
                 let lo = self.fetch8(bus) as u16;
                 let addr = 0xff00 | lo;
-                // OLD: bus.write_byte(addr, val);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.write_byte_with_ff50_log(bus, addr, val);
             }
             LoadByteTarget::MemHighC => {
                 let addr = 0xff00 | (self.regs.c as u16);
-                // OLD: bus.write_byte(addr, val);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.write_byte_with_ff50_log(bus, addr, val);
             }
             LoadByteTarget::HLI => {
                 let addr = self.regs.get_hl();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, val);
             }
             // AF, SP, PC not valid byte targets via this enum
@@ -876,32 +906,39 @@ impl CPU {
             LoadByteSource::L => self.regs.l,
             LoadByteSource::MemReg16(Reg16::HL) => {
                 let addr = self.regs.get_hl();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.read_byte(addr)
             }
             LoadByteSource::MemReg16(Reg16::BC) => {
                 let addr = self.regs.get_bc();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.read_byte(addr)
             }
             LoadByteSource::MemReg16(Reg16::DE) => {
                 let addr = self.regs.get_de();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.read_byte(addr)
             }
             LoadByteSource::MemImm16 => {
                 let addr = self.fetch16(bus);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.read_byte(addr)
             }
             LoadByteSource::MemImm8 => {
                 let lo = self.fetch8(bus) as u16;
                 let addr = 0xff00 | lo;
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.read_byte(addr)
             }
             LoadByteSource::MemHighC => {
                 let addr = 0xff00 | (self.regs.c as u16);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.read_byte(addr)
             }
             LoadByteSource::D8 => self.fetch8(bus),
             LoadByteSource::HLI => {
                 let addr = self.regs.get_hl();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.read_byte(addr)
             }
             LoadByteSource::MemReg16(_) => {
@@ -1118,25 +1155,33 @@ impl CPU {
             // ---------- HL auto-increment/decrement ----------
             Instruction::LdHliA => {
                 let addr = self.regs.get_hl();
-                bus.write_byte(addr, self.regs.a);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
+                // Write and IDU increment in the same M-cycle → single Write Corruption.
+                bus.oam_write_during_inc(addr, self.regs.a);
                 self.regs.set_hl(addr.wrapping_add(1));
                 8
             }
             Instruction::LdAHli => {
                 let addr = self.regs.get_hl();
-                self.regs.a = bus.read_byte(addr);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
+                // Read and IDU increment in the same M-cycle → Read-During-Inc/Dec Corruption.
+                self.regs.a = bus.oam_read_during_inc(addr);
                 self.regs.set_hl(addr.wrapping_add(1));
                 8
             }
             Instruction::LdHldA => {
                 let addr = self.regs.get_hl();
-                bus.write_byte(addr, self.regs.a);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
+                // Write and IDU decrement in the same M-cycle → single Write Corruption.
+                bus.oam_write_during_inc(addr, self.regs.a);
                 self.regs.set_hl(addr.wrapping_sub(1));
                 8
             }
             Instruction::LdAHld => {
                 let addr = self.regs.get_hl();
-                self.regs.a = bus.read_byte(addr);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
+                // Read and IDU decrement in the same M-cycle → Read-During-Inc/Dec Corruption.
+                self.regs.a = bus.oam_read_during_inc(addr);
                 self.regs.set_hl(addr.wrapping_sub(1));
                 8
             }
@@ -1189,8 +1234,10 @@ impl CPU {
             Instruction::INC8(LoadByteTarget::L) => inc8_reg!(self, l),
             Instruction::INC8(LoadByteTarget::MemReg16(Reg16::HL)) => {
                 let addr = self.regs.get_hl();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 let v = bus.read_byte(addr);
                 let r = self.alu_inc8(v);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, r);
                 12
             }
@@ -1205,8 +1252,10 @@ impl CPU {
             Instruction::DEC8(LoadByteTarget::L) => dec8_reg!(self, l),
             Instruction::DEC8(LoadByteTarget::MemReg16(Reg16::HL)) => {
                 let addr = self.regs.get_hl();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 let v = bus.read_byte(addr);
                 let r = self.alu_dec8(v);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, r);
                 12
             }
@@ -1233,16 +1282,25 @@ impl CPU {
             Instruction::LD(LoadType::Byte(LoadByteTarget::L, LoadByteSource::D8)) => {
                 ld_d8!(self, bus, l)
             }
+            // 0x36: LD (HL), n — fetch immediate + write to memory = 12 cycles
+            Instruction::LD(LoadType::Byte(LoadByteTarget::MemReg16(Reg16::HL), LoadByteSource::D8)) => {
+                let n = self.fetch8(bus);
+                let addr = self.regs.get_hl();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
+                bus.write_byte(addr, n);
+                12
+            }
 
             // ---------- Absolute addressing ----------
             Instruction::LD(LoadType::Byte(LoadByteTarget::MemImm16, LoadByteSource::A)) => {
                 let addr = self.fetch16(bus);
-                // OLD: bus.write_byte(addr, self.regs.a);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.write_byte_with_ff50_log(bus, addr, self.regs.a);
                 16
             }
             Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemImm16)) => {
                 let addr = self.fetch16(bus);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.regs.a = bus.read_byte(addr);
                 16
             }
@@ -1260,12 +1318,13 @@ impl CPU {
             }
             Instruction::LD(LoadType::Byte(LoadByteTarget::MemHighC, LoadByteSource::A)) => {
                 let addr = 0xff00 | (self.regs.c as u16);
-                // OLD: bus.write_byte(addr, self.regs.a);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.write_byte_with_ff50_log(bus, addr, self.regs.a);
                 8
             }
             Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemHighC)) => {
                 let addr = 0xff00 | (self.regs.c as u16);
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.regs.a = bus.read_byte(addr);
                 8
             }
@@ -1275,6 +1334,7 @@ impl CPU {
                 LoadType::Byte(LoadByteTarget::MemReg16(Reg16::BC), LoadByteSource::A),
             ) => {
                 let addr = self.regs.get_bc();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, self.regs.a);
                 8
             }
@@ -1282,6 +1342,7 @@ impl CPU {
                 LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemReg16(Reg16::BC)),
             ) => {
                 let addr = self.regs.get_bc();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.regs.a = bus.read_byte(addr);
                 8
             }
@@ -1289,6 +1350,7 @@ impl CPU {
                 LoadType::Byte(LoadByteTarget::MemReg16(Reg16::DE), LoadByteSource::A),
             ) => {
                 let addr = self.regs.get_de();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, self.regs.a);
                 8
             }
@@ -1296,6 +1358,7 @@ impl CPU {
                 LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemReg16(Reg16::DE)),
             ) => {
                 let addr = self.regs.get_de();
+                bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.regs.a = bus.read_byte(addr);
                 8
             }
@@ -1488,42 +1551,50 @@ impl CPU {
 
             // ---------- 16-bit INC ----------
             Instruction::INC(IncDecTarget::BC) => {
-                let v = self.regs.get_bc().wrapping_add(1);
-                self.regs.set_bc(v);
+                let old = self.regs.get_bc();
+                bus.idu_oam_corrupt(old);
+                self.regs.set_bc(old.wrapping_add(1));
                 8
             }
             Instruction::INC(IncDecTarget::DE) => {
-                let v = self.regs.get_de().wrapping_add(1);
-                self.regs.set_de(v);
+                let old = self.regs.get_de();
+                bus.idu_oam_corrupt(old);
+                self.regs.set_de(old.wrapping_add(1));
                 8
             }
             Instruction::INC(IncDecTarget::HL) => {
-                let v = self.regs.get_hl().wrapping_add(1);
-                self.regs.set_hl(v);
+                let old = self.regs.get_hl();
+                bus.idu_oam_corrupt(old);
+                self.regs.set_hl(old.wrapping_add(1));
                 8
             }
             Instruction::INC(IncDecTarget::SP) => {
+                bus.idu_oam_corrupt(self.sp);
                 self.sp = self.sp.wrapping_add(1);
                 8
             }
 
             // ---------- 16-bit DEC ----------
             Instruction::DEC(IncDecTarget::BC) => {
-                let v = self.regs.get_bc().wrapping_sub(1);
-                self.regs.set_bc(v);
+                let old = self.regs.get_bc();
+                bus.idu_oam_corrupt(old);
+                self.regs.set_bc(old.wrapping_sub(1));
                 8
             }
             Instruction::DEC(IncDecTarget::DE) => {
-                let v = self.regs.get_de().wrapping_sub(1);
-                self.regs.set_de(v);
+                let old = self.regs.get_de();
+                bus.idu_oam_corrupt(old);
+                self.regs.set_de(old.wrapping_sub(1));
                 8
             }
             Instruction::DEC(IncDecTarget::HL) => {
-                let v = self.regs.get_hl().wrapping_sub(1);
-                self.regs.set_hl(v);
+                let old = self.regs.get_hl();
+                bus.idu_oam_corrupt(old);
+                self.regs.set_hl(old.wrapping_sub(1));
                 8
             }
             Instruction::DEC(IncDecTarget::SP) => {
+                bus.idu_oam_corrupt(self.sp);
                 self.sp = self.sp.wrapping_sub(1);
                 8
             }

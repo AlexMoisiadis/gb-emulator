@@ -250,7 +250,12 @@ impl MMU {
                 }
             }
 
-            0xff04..=0xff07 => timer.write_io(addr, value),
+            0xff04..=0xff07 => {
+                if addr == 0xff04 {
+                    apu.div_reset();
+                }
+                timer.write_io(addr, value);
+            }
 
             0xff10..=0xff3f => apu.write(addr, value),
 

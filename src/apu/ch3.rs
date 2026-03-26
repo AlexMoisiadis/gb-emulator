@@ -27,6 +27,19 @@ impl Ch3 {
         }
     }
 
+    /// Reset all registers on APU power-off but preserve wave RAM contents.
+    pub fn reset_registers(&mut self) {
+        self.dac_enabled = false;
+        self.freq = 0;
+        self.freq_timer = 0;
+        self.wave_pos = 0;
+        self.output_level = 0;
+        self.length_counter = 0;
+        self.length_enabled = false;
+        self.enabled = false;
+        // wave_ram intentionally NOT cleared
+    }
+
     pub fn tick(&mut self, tcycles: u32) {
         if !self.enabled || !self.dac_enabled {
             return;
@@ -77,10 +90,20 @@ impl Ch3 {
 
     // ---- Wave RAM -----------------------------------------------------------
     pub fn read_wave_ram(&self, addr: u16) -> u8 {
-        self.wave_ram[(addr - 0xff30) as usize]
+        if self.enabled && self.dac_enabled {
+            // DMG: while CH3 is active only the currently-accessed byte is readable.
+            self.wave_ram[(self.wave_pos / 2) as usize]
+        } else {
+            self.wave_ram[(addr - 0xff30) as usize]
+        }
     }
     pub fn write_wave_ram(&mut self, addr: u16, val: u8) {
-        self.wave_ram[(addr - 0xff30) as usize] = val;
+        if self.enabled && self.dac_enabled {
+            // DMG: while CH3 is active writes only affect the currently-accessed byte.
+            self.wave_ram[(self.wave_pos / 2) as usize] = val;
+        } else {
+            self.wave_ram[(addr - 0xff30) as usize] = val;
+        }
     }
 
     // ---- Register reads -----------------------------------------------------
@@ -110,21 +133,46 @@ impl Ch3 {
     pub fn write_nr33(&mut self, val: u8) {
         self.freq = (self.freq & 0x0700) | (val as u16);
     }
-    pub fn write_nr34(&mut self, val: u8) -> bool {
+    pub fn write_nr34(&mut self, val: u8, fs_step: u8) -> bool {
         self.freq = (self.freq & 0x00ff) | (((val & 0x07) as u16) << 8);
+        let prev_length_enabled = self.length_enabled;
         self.length_enabled = (val & 0x40) != 0;
+        // 0→1 enable clock fires BEFORE trigger sequence.
+        if !prev_length_enabled && self.length_enabled && (fs_step & 1 == 1) {
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[CH3] 0->1 len_en clock: len_before={}", self.length_counter);
+            self.clock_length();
+        }
         if (val & 0x80) != 0 {
-            self.trigger();
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[CH3] trigger fs_step={} len={} len_en={}", fs_step, self.length_counter, self.length_enabled);
+            self.trigger(fs_step);
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[CH3] trigger done: len={} enabled={}", self.length_counter, self.enabled);
             return true;
         }
         false
     }
 
-    fn trigger(&mut self) {
-        self.enabled = self.dac_enabled;
+    fn trigger(&mut self, fs_step: u8) {
+        if self.enabled && self.dac_enabled {
+            // DMG: triggering while active corrupts wave RAM.
+            // The byte just after the current wave position is written to position 0.
+            let src = ((self.wave_pos / 2) as usize + 1) % 16;
+            self.wave_ram[0] = self.wave_ram[src];
+        }
+        let is_first_half = fs_step & 1 == 1;
         if self.length_counter == 0 {
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[CH3] trigger reload len 0->256");
             self.length_counter = 256;
         }
+        if self.length_enabled && is_first_half {
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[CH3] trigger extra clock: len_before={}", self.length_counter);
+            self.clock_length();
+        }
+        self.enabled = self.dac_enabled;
         self.freq_timer = (2048 - (self.freq as u32)) * 2;
         self.wave_pos = 0;
     }

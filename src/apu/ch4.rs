@@ -139,20 +139,39 @@ impl Ch4 {
         self.lfsr_width = (val & 0x08) != 0;
         self.divisor_code = val & 0x07;
     }
-    pub fn write_nr44(&mut self, val: u8) -> bool {
+    pub fn write_nr44(&mut self, val: u8, fs_step: u8) -> bool {
+        let prev_length_enabled = self.length_enabled;
         self.length_enabled = (val & 0x40) != 0;
+        // 0→1 enable clock fires BEFORE trigger sequence.
+        if !prev_length_enabled && self.length_enabled && (fs_step & 1 == 1) {
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[CH4] 0->1 len_en clock: len_before={}", self.length_counter);
+            self.clock_length();
+        }
         if (val & 0x80) != 0 {
-            self.trigger();
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[CH4] trigger fs_step={} len={} len_en={}", fs_step, self.length_counter, self.length_enabled);
+            self.trigger(fs_step);
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[CH4] trigger done: len={} enabled={}", self.length_counter, self.enabled);
             return true;
         }
         false
     }
 
-    fn trigger(&mut self) {
-        self.enabled = self.dac_enabled;
+    fn trigger(&mut self, fs_step: u8) {
+        let is_first_half = fs_step & 1 == 1;
         if self.length_counter == 0 {
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[CH4] trigger reload len 0->64");
             self.length_counter = 64;
         }
+        if self.length_enabled && is_first_half {
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[CH4] trigger extra clock: len_before={}", self.length_counter);
+            self.clock_length();
+        }
+        self.enabled = self.dac_enabled;
         self.reload_timer();
         self.env_timer = self.env_period;
         self.current_vol = self.env_initial_vol;

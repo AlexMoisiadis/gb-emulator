@@ -24,6 +24,28 @@ const MODE3_BASE_DOTS: u16 = 172;
 
 type Tile = [[TilePixelValue; 8]; 8];
 
+/// Which kind of OAM corruption to apply (DMG hardware bug).
+#[derive(Copy, Clone, Debug)]
+pub enum OamCorruptionKind {
+    Write,
+    Read,
+    ReadDuringIncDec,
+}
+
+// OAM row word helpers — operate on the raw [u8; 160] array.
+// Each "row" is 8 bytes = 4 16-bit words. Word index: 0..=3.
+#[inline]
+fn oam_rw(oam: &[u8; 160], row: usize, word: usize) -> u16 {
+    let base = row * 8 + word * 2;
+    (oam[base] as u16) | ((oam[base + 1] as u16) << 8)
+}
+#[inline]
+fn oam_ww(oam: &mut [u8; 160], row: usize, word: usize, val: u16) {
+    let base = row * 8 + word * 2;
+    oam[base]     = val as u8;
+    oam[base + 1] = (val >> 8) as u8;
+}
+
 bitflags::bitflags! {
     pub struct IfBits: u8 {
         const VBLANK   = 0b0000_0001;
@@ -321,7 +343,7 @@ impl GPU {
     }
 
     #[inline]
-    fn lcd_enabled(&self) -> bool {
+    pub fn lcd_enabled(&self) -> bool {
         (self.lcdc & 0x80) != 0
     }
 
@@ -401,18 +423,91 @@ impl GPU {
     // OAM access
     #[inline]
     pub fn read_oam(&self, i: usize) -> u8 {
-        if self.lcd_enabled() && matches!(self.mode, PpuMode::Oam2 | PpuMode::Xfer3) {
-            return 0xff;
-        }
         self.oam.get(i).copied().unwrap_or(0)
     }
     #[inline]
     pub fn write_oam(&mut self, i: usize, v: u8) {
-        if self.lcd_enabled() && matches!(self.mode, PpuMode::Oam2 | PpuMode::Xfer3) {
-            return;
-        }
         if i < self.oam.len() {
             self.oam[i] = v;
+        }
+    }
+
+    // OAM corruption helpers
+    pub fn is_oam2_active(&self) -> bool {
+        self.lcd_enabled() && matches!(self.mode, PpuMode::Oam2)
+    }
+
+    pub fn is_xfer3_active(&self) -> bool {
+        self.lcd_enabled() && matches!(self.mode, PpuMode::Xfer3)
+    }
+
+    pub fn oam2_row(&self) -> usize {
+        (self.mode_dot as usize) / 4
+    }
+
+    /// Row currently being scanned, accounting for `extra_tcycles` elapsed
+    /// within the current instruction (for per-M-cycle accurate corruption).
+    pub fn oam_row_with_offset(&self, extra_tcycles: u32) -> usize {
+        ((self.mode_dot as u32 + extra_tcycles) as usize / 4).min(19)
+    }
+
+    pub fn corrupt_oam_row(&mut self, row: usize, kind: OamCorruptionKind) {
+        match kind {
+            OamCorruptionKind::Write => {
+                if row == 0 { return; }
+                let a = oam_rw(&self.oam, row, 0);
+                let b = oam_rw(&self.oam, row - 1, 0);
+                let c = oam_rw(&self.oam, row - 1, 2);
+                let w1 = oam_rw(&self.oam, row - 1, 1);
+                let w3 = oam_rw(&self.oam, row - 1, 3);
+                oam_ww(&mut self.oam, row, 0, (a ^ c) & (b ^ c) ^ c);
+                oam_ww(&mut self.oam, row, 1, w1);
+                oam_ww(&mut self.oam, row, 2, c);
+                oam_ww(&mut self.oam, row, 3, w3);
+            }
+            OamCorruptionKind::Read => {
+                if row == 0 { return; }
+                let a = oam_rw(&self.oam, row, 0);
+                let b = oam_rw(&self.oam, row - 1, 0);
+                let c = oam_rw(&self.oam, row - 1, 2);
+                let w1 = oam_rw(&self.oam, row - 1, 1);
+                let w3 = oam_rw(&self.oam, row - 1, 3);
+                oam_ww(&mut self.oam, row, 0, b | (a & c));
+                oam_ww(&mut self.oam, row, 1, w1);
+                oam_ww(&mut self.oam, row, 2, c);
+                oam_ww(&mut self.oam, row, 3, w3);
+            }
+            OamCorruptionKind::ReadDuringIncDec => {
+                // Step 1: complex pattern (rows 4–18 only)
+                if row >= 4 && row < 19 {
+                    let a  = oam_rw(&self.oam, row - 2, 0);
+                    let b  = oam_rw(&self.oam, row - 1, 0);
+                    let c  = oam_rw(&self.oam, row,     0);
+                    let d  = oam_rw(&self.oam, row - 1, 2);
+                    let new_b = (b & (a | c | d)) | (a & c & d);
+                    let row_m1 = [new_b,
+                                  oam_rw(&self.oam, row - 1, 1),
+                                  oam_rw(&self.oam, row - 1, 2),
+                                  oam_rw(&self.oam, row - 1, 3)];
+                    oam_ww(&mut self.oam, row - 1, 0, new_b);
+                    for wi in 0..4usize {
+                        oam_ww(&mut self.oam, row,     wi, row_m1[wi]);
+                        oam_ww(&mut self.oam, row - 2, wi, row_m1[wi]);
+                    }
+                }
+                // Step 2: Read Corruption to row R (always, if row > 0)
+                if row > 0 {
+                    let a = oam_rw(&self.oam, row, 0);
+                    let b = oam_rw(&self.oam, row - 1, 0);
+                    let c = oam_rw(&self.oam, row - 1, 2);
+                    let w1 = oam_rw(&self.oam, row - 1, 1);
+                    let w3 = oam_rw(&self.oam, row - 1, 3);
+                    oam_ww(&mut self.oam, row, 0, b | (a & c));
+                    oam_ww(&mut self.oam, row, 1, w1);
+                    oam_ww(&mut self.oam, row, 2, c);
+                    oam_ww(&mut self.oam, row, 3, w3);
+                }
+            }
         }
     }
 

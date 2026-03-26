@@ -18,6 +18,18 @@ pub struct FrameSequencer {
 }
 
 impl FrameSequencer {
+    /// Returns the next step index that will fire (0–7).
+    pub fn step(&self) -> u8 {
+        self.step
+    }
+
+    /// Reset the frame sequencer timer when DIV is written (same internal counter on DMG).
+    pub fn div_reset(&mut self) {
+        #[cfg(feature = "trace_apu")]
+        eprintln!("[FS] div_reset timer (step={})", self.step);
+        self.timer = 8192;
+    }
+
     pub fn new() -> Self {
         Self {
             timer: 8192,
@@ -47,6 +59,8 @@ impl FrameSequencer {
     }
 
     fn fire(&self, ev: &mut FsEvents) {
+        #[cfg(feature = "trace_apu")]
+        eprintln!("[FS] fire step={}", self.step);
         // Step:  0  1  2  3  4  5  6  7
         // Len:   ✓     ✓     ✓     ✓
         // Sweep:       ✓           ✓

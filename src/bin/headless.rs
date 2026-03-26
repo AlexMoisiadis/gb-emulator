@@ -1,6 +1,7 @@
 use gb_emulator::{ CPU, MemoryBus };
 use gb_emulator::trace::{ self, Category as TraceCategory };
 use gb_emulator::util::save_png;
+use std::io::Write as IoWrite;
 
 const W: usize = 160;
 const H: usize = 144;
@@ -16,6 +17,51 @@ enum TimeoutReason {
     None,
     Budget,
     LcdOffWindow,
+}
+
+struct BlarggMonitor {
+    signature_valid: bool,
+    text_pos: u16,
+}
+
+impl BlarggMonitor {
+    fn new() -> Self {
+        Self { signature_valid: false, text_pos: 0 }
+    }
+
+    fn is_active(&self) -> bool { self.signature_valid }
+
+    /// Drain new text chars from $A004+, then check for completion.
+    /// Returns Some(status_code) when the test finishes, None while still running.
+    fn poll(&mut self, bus: &mut MemoryBus) -> Option<u8> {
+        if !self.signature_valid {
+            if bus.read_byte(0xa001) == 0xde
+                && bus.read_byte(0xa002) == 0xb0
+                && bus.read_byte(0xa003) == 0x61
+            {
+                self.signature_valid = true;
+            } else {
+                return None;
+            }
+        }
+        let status = bus.read_byte(0xa000);
+        // 0x00 / 0xFF = RAM not yet initialized by the ROM; wait.
+        // 0x80 = test running (properly initialized).
+        // anything else = final result code.
+        if status == 0xff {
+            return None; // RAM not yet initialized by the ROM; wait
+        }
+        // Drain any newly-appended text. Stop on null terminator or 0xFF
+        // (uninitialized RAM sentinel) to avoid printing garbage.
+        loop {
+            let b = bus.read_byte(0xa004 + self.text_pos);
+            if b == 0 || b == 0xff { break; }
+            print!("{}", b as char);
+            self.text_pos += 1;
+        }
+        let _ = std::io::stdout().flush();
+        if status != 0x80 { Some(status) } else { None }
+    }
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -73,6 +119,11 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(2);
+    let blargg_max_frames = std::env
+        ::var("GB_HEADLESS_BLARGG_MAX_FRAMES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(5000);
 
     // post_boot_init (same as viewer)
     cpu.regs.set_af(0x01b0);
@@ -93,8 +144,12 @@ fn main() -> anyhow::Result<()> {
     let mut hard_timeouts: u32 = 0;
     let mut warmup_timeouts: u32 = 0;
     let mut lcd_off_skips: u32 = 0;
+    let mut blargg = BlarggMonitor::new();
 
-    for f in 0..frames_to_dump {
+    let mut f = 0u32;
+    loop {
+        let limit = if blargg.is_active() { blargg_max_frames } else { frames_to_dump };
+        if f >= limit { break; }
         let mut safety_dots = 0u32;
         let mut lcd_on_seen = (bus.read_byte(0xff40) & 0x80) != 0;
         let mut timeout_reason = TimeoutReason::None;
@@ -108,19 +163,19 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
 
-            // Blargg status register: 0x80 = running, 0x01 = passed, other = failure code
-            let blargg_status = bus.read_byte(0xa000);
-            if blargg_status != 0x00 && blargg_status != 0x80 && blargg_status != 0xff {
-                if blargg_status == 0x01 {
+            // Blargg test output: print text from $A004+ and detect completion
+            if let Some(status) = blargg.poll(&mut bus) {
+                println!();
+                if status == 0x00 {
                     eprintln!("blargg: PASSED");
                 } else {
-                    eprintln!("blargg: FAILED (code={:#04x})", blargg_status);
+                    eprintln!("blargg: FAILED (code={:#04x})", status);
                 }
                 if save_final {
                     bus.gpu.copy_frame(&mut fb);
                     save_png(&fb, &final_path)?;
                 }
-                std::process::exit(if blargg_status == 0x01 { 0 } else { 1 });
+                std::process::exit(if status == 0x00 { 0 } else { 1 });
             }
 
             let cy = cpu.step(&mut bus);
@@ -163,6 +218,7 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        f += 1;
     }
 
     // Save the final frame if requested

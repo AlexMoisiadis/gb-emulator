@@ -12,9 +12,9 @@ pub const DUTY_TABLE: [[u8; 8]; 4] = [
 ];
 
 pub struct PulseChannel {
-    pub duty: u8,      // 0–3
-    pub duty_pos: u8,  // 0–7, position in duty waveform
-    pub freq: u16,     // 11-bit frequency register value
+    pub duty: u8, // 0–3
+    pub duty_pos: u8, // 0–7, position in duty waveform
+    pub freq: u16, // 11-bit frequency register value
     pub freq_timer: u32, // T-cycle countdown
 
     pub length_counter: u8,
@@ -33,7 +33,7 @@ pub struct PulseChannel {
 impl PulseChannel {
     pub fn new() -> Self {
         Self {
-            duty: 2,
+            duty: 0,
             duty_pos: 0,
             freq: 0,
             freq_timer: 0,
@@ -64,7 +64,7 @@ impl PulseChannel {
             remaining -= advance;
             if self.freq_timer == 0 {
                 // Pulse channels reload at (2048 - freq) * 4 T-cycles
-                self.freq_timer = (2048 - self.freq as u32) * 4;
+                self.freq_timer = (2048 - (self.freq as u32)) * 4;
                 self.duty_pos = (self.duty_pos + 1) & 7;
             }
         }
@@ -127,9 +127,7 @@ impl PulseChannel {
     }
 
     pub fn read_envelope(&self) -> u8 {
-        (self.env_initial_vol << 4)
-            | (if self.env_add_mode { 0x08 } else { 0 })
-            | self.env_period
+        (self.env_initial_vol << 4) | (if self.env_add_mode { 0x08 } else { 0 }) | self.env_period
     }
 
     pub fn read_freq_hi(&self) -> u8 {
@@ -165,25 +163,48 @@ impl PulseChannel {
     }
 
     /// NRx4: high 3 bits of frequency + length enable + trigger.
-    /// Calls `self.trigger()` internally if the trigger bit is set.
+    /// `fs_step` is the frame sequencer's next-to-fire step (0–7); used for the
+    /// "extra length clock in first half of length period" DMG quirk.
     /// Returns true if a trigger occurred (caller may need extra init, e.g. sweep).
-    pub fn write_freq_hi(&mut self, val: u8) -> bool {
+    pub fn write_freq_hi(&mut self, val: u8, fs_step: u8) -> bool {
         self.freq = (self.freq & 0x00ff) | (((val & 0x07) as u16) << 8);
+        let prev_length_enabled = self.length_enabled;
         self.length_enabled = (val & 0x40) != 0;
+        // 0→1 enable clock fires BEFORE trigger sequence.
+        if !prev_length_enabled && self.length_enabled && (fs_step & 1) == 1 {
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[PULSE] 0->1 len_en clock: len_before={}", self.length_counter);
+            self.clock_length();
+        }
         if (val & 0x80) != 0 {
-            self.trigger();
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[PULSE] trigger fs_step={} len={} len_en={}", fs_step, self.length_counter, self.length_enabled);
+            self.trigger(fs_step);
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[PULSE] trigger done: len={} enabled={}", self.length_counter, self.enabled);
             return true;
         }
         false
     }
 
     /// Common trigger: enable channel, reload length/freq_timer/envelope.
-    pub fn trigger(&mut self) {
-        self.enabled = self.dac_enabled;
+    /// Applies extra length clock when triggered in first half of length period,
+    /// using the NEW `length_enabled` state (post-write).
+    pub fn trigger(&mut self, fs_step: u8) {
+        let is_first_half = (fs_step & 1) == 1;
         if self.length_counter == 0 {
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[PULSE] trigger reload len 0->64");
             self.length_counter = 64;
         }
-        self.freq_timer = (2048 - self.freq as u32) * 4;
+        if self.length_enabled && is_first_half {
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[PULSE] trigger extra clock: len_before={}", self.length_counter);
+            self.clock_length();
+        }
+        // Enable AFTER all length manipulation so trigger always wins.
+        self.enabled = self.dac_enabled;
+        self.freq_timer = (2048 - (self.freq as u32)) * 4;
         self.env_timer = self.env_period;
         self.current_vol = self.env_initial_vol;
     }

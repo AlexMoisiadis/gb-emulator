@@ -12,6 +12,9 @@ pub struct Ch1 {
     sweep_timer: u8,
     sweep_shadow_freq: u16,
     sweep_enabled: bool,
+    /// Set when a sweep calculation uses negate mode; cleared on trigger.
+    /// Clearing NR10 negate after this disables the channel (DMG quirk).
+    sweep_negate_used: bool,
 }
 
 impl Ch1 {
@@ -24,6 +27,7 @@ impl Ch1 {
             sweep_timer: 0,
             sweep_shadow_freq: 0,
             sweep_enabled: false,
+            sweep_negate_used: false,
         }
     }
 
@@ -67,9 +71,10 @@ impl Ch1 {
         false
     }
 
-    fn calc_sweep_freq(&self) -> u16 {
+    fn calc_sweep_freq(&mut self) -> u16 {
         let delta = self.sweep_shadow_freq >> self.sweep_shift;
         if self.sweep_negate {
+            self.sweep_negate_used = true;
             self.sweep_shadow_freq.wrapping_sub(delta)
         } else {
             self.sweep_shadow_freq.wrapping_add(delta)
@@ -103,8 +108,14 @@ impl Ch1 {
     // -------------------------------------------------------------------------
 
     pub fn write_nr10(&mut self, val: u8) {
+        let new_negate = (val & 0x08) != 0;
+        // DMG quirk: clearing negate after it was used in a sweep calculation
+        // disables the channel immediately.
+        if self.sweep_negate && !new_negate && self.sweep_negate_used {
+            self.pulse.enabled = false;
+        }
         self.sweep_period = (val >> 4) & 0x07;
-        self.sweep_negate = (val & 0x08) != 0;
+        self.sweep_negate = new_negate;
         self.sweep_shift = val & 0x07;
     }
 
@@ -122,8 +133,8 @@ impl Ch1 {
     }
 
     /// Returns true if a trigger occurred.
-    pub fn write_nr14(&mut self, val: u8) -> bool {
-        let triggered = self.pulse.write_freq_hi(val);
+    pub fn write_nr14(&mut self, val: u8, fs_step: u8) -> bool {
+        let triggered = self.pulse.write_freq_hi(val, fs_step);
         if triggered {
             self.init_sweep();
         }
@@ -136,7 +147,9 @@ impl Ch1 {
         let period = if self.sweep_period > 0 { self.sweep_period } else { 8 };
         self.sweep_timer = period;
         self.sweep_enabled = self.sweep_period > 0 || self.sweep_shift > 0;
-        // Immediately check for overflow
+        // Clear before the overflow check so that if negate is used here,
+        // the flag persists — clearing NR10 negate after this must disable the channel.
+        self.sweep_negate_used = false;
         if self.sweep_shift > 0 && self.calc_sweep_freq() > 2047 {
             self.pulse.enabled = false;
         }

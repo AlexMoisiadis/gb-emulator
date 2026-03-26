@@ -103,17 +103,27 @@ impl Apu {
 
         // 3) Frame-sequencer triggered units.
         if fs.clock_length {
+            #[cfg(feature = "trace_apu")]
+            eprintln!("[APU] FS clock_length (step={})", self.frame_seq.step().wrapping_sub(1) & 7);
             if self.ch1.clock_length() {
                 self.nr52 &= !0x01;
+                #[cfg(feature = "trace_apu")]
+                eprintln!("[APU] ch1 silenced by length");
             }
             if self.ch2.clock_length() {
                 self.nr52 &= !0x02;
+                #[cfg(feature = "trace_apu")]
+                eprintln!("[APU] ch2 silenced by length");
             }
             if self.ch3.clock_length() {
                 self.nr52 &= !0x04;
+                #[cfg(feature = "trace_apu")]
+                eprintln!("[APU] ch3 silenced by length");
             }
             if self.ch4.clock_length() {
                 self.nr52 &= !0x08;
+                #[cfg(feature = "trace_apu")]
+                eprintln!("[APU] ch4 silenced by length");
             }
         }
         if fs.clock_envelope {
@@ -182,7 +192,11 @@ impl Apu {
                     ((self.ch2.enabled() as u8) << 1) |
                     ((self.ch3.enabled() as u8) << 2) |
                     ((self.ch4.enabled() as u8) << 3);
-                (self.nr52 & 0x80) | 0x70 | ch_bits
+                let result = (self.nr52 & 0x80) | 0x70 | ch_bits;
+                #[cfg(feature = "trace_apu")]
+                eprintln!("[APU] NR52 read={:#04x} (ch1={} ch2={} ch3={} ch4={})",
+                    result, self.ch1.enabled(), self.ch2.enabled(), self.ch3.enabled(), self.ch4.enabled());
+                result
             }
 
             // ---- Wave RAM (FF30–FF3F) ---------------------------------------
@@ -219,10 +233,14 @@ impl Apu {
             }
             0xff14 => {
                 if apu_on {
-                    let triggered = self.ch1.write_nr14(val);
+                    #[cfg(feature = "trace_apu")]
+                    eprintln!("[APU] NR14 write={:#04x} fs_step={} len_en={} trigger={}", val, self.frame_seq.step(), (val & 0x40) != 0, (val & 0x80) != 0);
+                    let triggered = self.ch1.write_nr14(val, self.frame_seq.step());
                     if triggered {
                         self.nr52 |= 0x01;
                     }
+                    #[cfg(feature = "trace_apu")]
+                    eprintln!("[APU] NR14 after: ch1.enabled={}", self.ch1.enabled());
                 }
             }
 
@@ -243,10 +261,14 @@ impl Apu {
             }
             0xff19 => {
                 if apu_on {
-                    let triggered = self.ch2.write_nr24(val);
+                    #[cfg(feature = "trace_apu")]
+                    eprintln!("[APU] NR24 write={:#04x} fs_step={} len_en={} trigger={}", val, self.frame_seq.step(), (val & 0x40) != 0, (val & 0x80) != 0);
+                    let triggered = self.ch2.write_nr24(val, self.frame_seq.step());
                     if triggered {
                         self.nr52 |= 0x02;
                     }
+                    #[cfg(feature = "trace_apu")]
+                    eprintln!("[APU] NR24 after: ch2.enabled={}", self.ch2.enabled());
                 }
             }
 
@@ -271,10 +293,14 @@ impl Apu {
             }
             0xff1e => {
                 if apu_on {
-                    let triggered = self.ch3.write_nr34(val);
+                    #[cfg(feature = "trace_apu")]
+                    eprintln!("[APU] NR34 write={:#04x} fs_step={} len_en={} trigger={}", val, self.frame_seq.step(), (val & 0x40) != 0, (val & 0x80) != 0);
+                    let triggered = self.ch3.write_nr34(val, self.frame_seq.step());
                     if triggered {
                         self.nr52 |= 0x04;
                     }
+                    #[cfg(feature = "trace_apu")]
+                    eprintln!("[APU] NR34 after: ch3.enabled={}", self.ch3.enabled());
                 }
             }
 
@@ -295,10 +321,14 @@ impl Apu {
             }
             0xff23 => {
                 if apu_on {
-                    let triggered = self.ch4.write_nr44(val);
+                    #[cfg(feature = "trace_apu")]
+                    eprintln!("[APU] NR44 write={:#04x} fs_step={} len_en={} trigger={}", val, self.frame_seq.step(), (val & 0x40) != 0, (val & 0x80) != 0);
+                    let triggered = self.ch4.write_nr44(val, self.frame_seq.step());
                     if triggered {
                         self.nr52 |= 0x08;
                     }
+                    #[cfg(feature = "trace_apu")]
+                    eprintln!("[APU] NR44 after: ch4.enabled={}", self.ch4.enabled());
                 }
             }
 
@@ -318,6 +348,8 @@ impl Apu {
             0xff26 => {
                 let was_on = (self.nr52 & 0x80) != 0;
                 let now_on = (val & 0x80) != 0;
+                #[cfg(feature = "trace_apu")]
+                eprintln!("[APU] NR52 write={:#04x} was_on={} now_on={}", val, was_on, now_on);
                 self.nr52 = (self.nr52 & 0x7f) | (val & 0x80);
                 if was_on && !now_on {
                     self.power_off_reset();
@@ -334,6 +366,12 @@ impl Apu {
     // -------------------------------------------------------------------------
     // Audio thread interface
     // -------------------------------------------------------------------------
+
+    /// Called when the CPU writes to DIV (0xFF04) — resets the frame sequencer
+    /// timer, since on DMG hardware the FS is driven by the same internal counter.
+    pub fn div_reset(&mut self) {
+        self.frame_seq.div_reset();
+    }
 
     /// Drain pending interleaved stereo samples into `out`.
     /// The audio callback should call this and write the result to its buffer.
@@ -385,7 +423,7 @@ impl Apu {
     fn power_off_reset(&mut self) {
         self.ch1 = Ch1::new();
         self.ch2 = Ch2::new();
-        self.ch3 = Ch3::new();
+        self.ch3.reset_registers(); // wave RAM is preserved on DMG power-off
         self.ch4 = Ch4::new();
         self.frame_seq = FrameSequencer::new();
         self.nr50 = 0;

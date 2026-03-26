@@ -20,3 +20,4 @@ ringbuf = "0.4.8"
 debug_timing = []
 trace_ppu = []
 trace_input = []
+trace_apu = []

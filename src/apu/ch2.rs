@@ -52,7 +52,7 @@ impl Ch2 {
         self.pulse.write_freq_lo(val);
     }
     /// Returns true if a trigger occurred.
-    pub fn write_nr24(&mut self, val: u8) -> bool {
-        self.pulse.write_freq_hi(val)
+    pub fn write_nr24(&mut self, val: u8, fs_step: u8) -> bool {
+        self.pulse.write_freq_hi(val, fs_step)
     }
 }
