@@ -6,3 +6,4 @@ CLAUDE.md
 *.txt
 *.log
 *.gb
+src/roms/
