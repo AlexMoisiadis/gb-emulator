@@ -2,6 +2,12 @@
 name = "gb_emulator"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A cycle-accurate DMG (Game Boy) emulator written in Rust"
+authors = ["Alex Moisiadis"]
+license = "MIT"
+repository = "https://github.com/AlexMoisiadis/gb-emulator"
+readme = "README.md"
 
 [dependencies]
 
