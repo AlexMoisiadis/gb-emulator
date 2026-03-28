@@ -41,10 +41,6 @@ pub struct MemoryBus {
     /// T-cycles elapsed within the current instruction (reset at each step()).
     /// Used to compute the correct OAM row for per-M-cycle-accurate corruption.
     pub instruction_tcycles: u32,
-    /// T-cycles elapsed BEFORE the write M-cycle that enabled the LCD this step.
-    /// Set to u32::MAX when no LCD enable occurred this step (sentinel = inactive).
-    /// Used by service_gpu() to skip the pre-enable portion of the instruction.
-    pub lcd_enable_offset: u32,
 }
 
 impl MemoryBus {
@@ -64,27 +60,14 @@ impl MemoryBus {
             audio,
             audio_muted: false,
             instruction_tcycles: 0,
-            lcd_enable_offset: u32::MAX,
         }
     }
 
     #[inline]
     pub fn service_gpu(&mut self, tcycles: u32) {
-        // If the LCD was enabled mid-instruction this step, only advance the GPU
-        // by the T-cycles during which the LCD was actually on (the write M-cycle
-        // and any remaining M-cycles). The pre-enable portion is skipped.
-        // Consume the offset immediately so subsequent service_gpu calls within
-        // the same step (e.g. ISR dispatch) advance by their full cycle count.
-        let effective = if self.lcd_enable_offset != u32::MAX {
-            let offset = self.lcd_enable_offset;
-            self.lcd_enable_offset = u32::MAX;
-            tcycles.saturating_sub(offset)
-        } else {
-            tcycles
-        };
         let bus_ptr: *const MemoryBus = self as *const MemoryBus;
         let mut dma = DmaProxy { bus: bus_ptr };
-        let events: GpuEvents = self.gpu.tick(effective, &mut dma);
+        let events: GpuEvents = self.gpu.tick(tcycles, &mut dma);
         self.apply_gpu_events(events);
     }
 
@@ -200,11 +183,12 @@ impl MemoryBus {
         self.mmu.load_boot_rom(bytes);
     }
 
-    /// Compute the OAM row currently being scanned, accounting for T-cycles
-    /// elapsed within the current instruction (per-M-cycle accuracy).
+    /// Compute the OAM row currently being scanned.
+    /// With per-M-cycle GPU stepping, mode_dot already reflects the current
+    /// M-cycle boundary so no instruction_tcycles offset is needed.
     #[inline]
     fn oam_current_row(&self) -> usize {
-        self.gpu.oam_row_with_offset(self.instruction_tcycles)
+        self.gpu.oam2_row()
     }
 
     #[inline]
@@ -238,17 +222,7 @@ impl MemoryBus {
                 return;
             }
         }
-        // Detect LCD 0→1 transition for timing correction in service_gpu().
-        // Capture lcd_was_on only for LCDC writes to avoid the branch overhead
-        // on every write; default true so the post-write check is a no-op otherwise.
-        let lcd_was_on = address != 0xFF40 || self.gpu.lcd_enabled();
         self.mmu.write8(address, value, &mut self.gpu, &mut self.timer, &mut self.apu);
-        if !lcd_was_on && self.gpu.lcd_enabled() {
-            // instruction_tcycles was already incremented for the write M-cycle
-            // before write_byte was called, so subtract 4 to get the T-cycles
-            // elapsed BEFORE the write M-cycle (the portion when LCD was still off).
-            self.lcd_enable_offset = self.instruction_tcycles.saturating_sub(4);
-        }
     }
 
     /// For LD A,[HL+], LD A,[HL-], and instruction fetch from OAM range:

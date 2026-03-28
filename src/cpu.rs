@@ -64,6 +64,7 @@ pub struct CPU {
     last_pc: u16,
     last_op: u8,
     timer_consumed: u32,
+    gpu_consumed: u32,
 
     // --- NEW: low-noise debug snapshots (only used when debug_timing is on) ---
     #[cfg(feature = "debug_timing")]
@@ -93,6 +94,7 @@ impl CPU {
             last_pc: 0,
             last_op: 0,
             timer_consumed: 0,
+            gpu_consumed: 0,
 
             // --- NEW ---
             #[cfg(feature = "debug_timing")]
@@ -251,7 +253,9 @@ impl CPU {
             PrefixTarget::HL => {
                 let addr = self.regs.get_hl();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
-                bus.read_byte(addr)
+                let v = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
+                v
             }
         }
     }
@@ -284,6 +288,7 @@ impl CPU {
                 let addr = self.regs.get_hl();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, val);
+                bus.service_gpu(4); self.gpu_consumed += 4;
             }
         }
     }
@@ -436,8 +441,8 @@ impl CPU {
         self.step_index = self.step_index.saturating_add(1);
         trace::set_step(self.step_index);
         self.timer_consumed = 0;
+        self.gpu_consumed = 0;
         bus.instruction_tcycles = 0;
-        bus.lcd_enable_offset = u32::MAX;
 
         // --- EI delayed-IME semantics ----------------------------------------
         // If EI was executed previously, IME must become 1 *after* the next
@@ -455,7 +460,7 @@ impl CPU {
         // 2) Advance PPU by the same amount and surface its events into IF now.
         // Timer was already partially advanced per-M-cycle during execute_one();
         // only service the remaining T-cycles here to avoid double-counting.
-        bus.service_gpu(total_tcycles);
+        bus.service_gpu(total_tcycles.saturating_sub(self.gpu_consumed));
         bus.service_timer(total_tcycles.saturating_sub(self.timer_consumed));
         bus.service_apu(total_tcycles);
         bus.service_input();
@@ -678,10 +683,11 @@ impl CPU {
             self.pc = self.pc.wrapping_add(1);
         }
 
-        // Each fetch8 is one M-cycle (4 T-cycles); advance the timer now so
-        // mid-instruction TIMA reads reflect the correct in-progress state.
+        // Each fetch8 is one M-cycle (4 T-cycles); advance the timer and GPU now so
+        // mid-instruction TIMA reads and VBlank/STAT timing are accurate.
         bus.service_timer(4);
-        self.timer_consumed += 4; bus.instruction_tcycles += 4;
+        bus.service_gpu(4);
+        self.timer_consumed += 4; self.gpu_consumed += 4; bus.instruction_tcycles += 4;
 
         value
     }
@@ -701,10 +707,12 @@ impl CPU {
         bus.idu_oam_corrupt(self.sp);
         self.sp = self.sp.wrapping_sub(1);
         bus.write_byte(self.sp, (value >> 8) as u8);
+        bus.service_gpu(4); self.gpu_consumed += 4;
         bus.instruction_tcycles += 4;
         bus.idu_oam_corrupt(self.sp);
         self.sp = self.sp.wrapping_sub(1);
         bus.write_byte(self.sp, (value & 0x00ff) as u8);
+        bus.service_gpu(4); self.gpu_consumed += 4;
         bus.instruction_tcycles += 4;
     }
 
@@ -714,10 +722,12 @@ impl CPU {
         // "one read, one glitched write, and another read without a glitched write."
         // The first SP++ fires IDU Write Corruption; the second SP++ does NOT.
         let lo = bus.read_byte(self.sp) as u16;
+        bus.service_gpu(4); self.gpu_consumed += 4;
         bus.idu_oam_corrupt(self.sp);
         bus.instruction_tcycles += 4;
         self.sp = self.sp.wrapping_add(1);
         let hi = bus.read_byte(self.sp) as u16;
+        bus.service_gpu(4); self.gpu_consumed += 4;
         bus.instruction_tcycles += 4;
         // Second SP++ IDU is suppressed per hardware behaviour.
         self.sp = self.sp.wrapping_add(1);
@@ -853,37 +863,44 @@ impl CPU {
                 let addr = self.regs.get_hl();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, val);
+                bus.service_gpu(4); self.gpu_consumed += 4;
             }
             LoadByteTarget::MemReg16(Reg16::BC) => {
                 let addr = self.regs.get_bc();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, val);
+                bus.service_gpu(4); self.gpu_consumed += 4;
             }
             LoadByteTarget::MemReg16(Reg16::DE) => {
                 let addr = self.regs.get_de();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, val);
+                bus.service_gpu(4); self.gpu_consumed += 4;
             }
             LoadByteTarget::MemImm16 => {
                 let addr = self.fetch16(bus);
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.write_byte_with_ff50_log(bus, addr, val);
+                bus.service_gpu(4); self.gpu_consumed += 4;
             }
             LoadByteTarget::MemImm8 => {
                 let lo = self.fetch8(bus) as u16;
                 let addr = 0xff00 | lo;
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.write_byte_with_ff50_log(bus, addr, val);
+                bus.service_gpu(4); self.gpu_consumed += 4;
             }
             LoadByteTarget::MemHighC => {
                 let addr = 0xff00 | (self.regs.c as u16);
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.write_byte_with_ff50_log(bus, addr, val);
+                bus.service_gpu(4); self.gpu_consumed += 4;
             }
             LoadByteTarget::HLI => {
                 let addr = self.regs.get_hl();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, val);
+                bus.service_gpu(4); self.gpu_consumed += 4;
             }
             // AF, SP, PC not valid byte targets via this enum
 
@@ -907,39 +924,53 @@ impl CPU {
             LoadByteSource::MemReg16(Reg16::HL) => {
                 let addr = self.regs.get_hl();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
-                bus.read_byte(addr)
+                let v = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
+                v
             }
             LoadByteSource::MemReg16(Reg16::BC) => {
                 let addr = self.regs.get_bc();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
-                bus.read_byte(addr)
+                let v = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
+                v
             }
             LoadByteSource::MemReg16(Reg16::DE) => {
                 let addr = self.regs.get_de();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
-                bus.read_byte(addr)
+                let v = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
+                v
             }
             LoadByteSource::MemImm16 => {
                 let addr = self.fetch16(bus);
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
-                bus.read_byte(addr)
+                let v = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
+                v
             }
             LoadByteSource::MemImm8 => {
                 let lo = self.fetch8(bus) as u16;
                 let addr = 0xff00 | lo;
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
-                bus.read_byte(addr)
+                let v = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
+                v
             }
             LoadByteSource::MemHighC => {
                 let addr = 0xff00 | (self.regs.c as u16);
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
-                bus.read_byte(addr)
+                let v = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
+                v
             }
             LoadByteSource::D8 => self.fetch8(bus),
             LoadByteSource::HLI => {
                 let addr = self.regs.get_hl();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
-                bus.read_byte(addr)
+                let v = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
+                v
             }
             LoadByteSource::MemReg16(_) => {
                 // NEW: show which one before trapping
@@ -1158,6 +1189,7 @@ impl CPU {
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 // Write and IDU increment in the same M-cycle → single Write Corruption.
                 bus.oam_write_during_inc(addr, self.regs.a);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 self.regs.set_hl(addr.wrapping_add(1));
                 8
             }
@@ -1166,6 +1198,7 @@ impl CPU {
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 // Read and IDU increment in the same M-cycle → Read-During-Inc/Dec Corruption.
                 self.regs.a = bus.oam_read_during_inc(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 self.regs.set_hl(addr.wrapping_add(1));
                 8
             }
@@ -1174,6 +1207,7 @@ impl CPU {
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 // Write and IDU decrement in the same M-cycle → single Write Corruption.
                 bus.oam_write_during_inc(addr, self.regs.a);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 self.regs.set_hl(addr.wrapping_sub(1));
                 8
             }
@@ -1182,6 +1216,7 @@ impl CPU {
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 // Read and IDU decrement in the same M-cycle → Read-During-Inc/Dec Corruption.
                 self.regs.a = bus.oam_read_during_inc(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 self.regs.set_hl(addr.wrapping_sub(1));
                 8
             }
@@ -1236,9 +1271,11 @@ impl CPU {
                 let addr = self.regs.get_hl();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 let v = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 let r = self.alu_inc8(v);
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, r);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 12
             }
 
@@ -1254,9 +1291,11 @@ impl CPU {
                 let addr = self.regs.get_hl();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 let v = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 let r = self.alu_dec8(v);
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, r);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 12
             }
 
@@ -1288,6 +1327,7 @@ impl CPU {
                 let addr = self.regs.get_hl();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, n);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 12
             }
 
@@ -1296,12 +1336,14 @@ impl CPU {
                 let addr = self.fetch16(bus);
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.write_byte_with_ff50_log(bus, addr, self.regs.a);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 16
             }
             Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemImm16)) => {
                 let addr = self.fetch16(bus);
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.regs.a = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 16
             }
 
@@ -1320,12 +1362,14 @@ impl CPU {
                 let addr = 0xff00 | (self.regs.c as u16);
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.write_byte_with_ff50_log(bus, addr, self.regs.a);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 8
             }
             Instruction::LD(LoadType::Byte(LoadByteTarget::A, LoadByteSource::MemHighC)) => {
                 let addr = 0xff00 | (self.regs.c as u16);
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.regs.a = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 8
             }
 
@@ -1336,6 +1380,7 @@ impl CPU {
                 let addr = self.regs.get_bc();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, self.regs.a);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 8
             }
             Instruction::LD(
@@ -1344,6 +1389,7 @@ impl CPU {
                 let addr = self.regs.get_bc();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.regs.a = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 8
             }
             Instruction::LD(
@@ -1352,6 +1398,7 @@ impl CPU {
                 let addr = self.regs.get_de();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 bus.write_byte(addr, self.regs.a);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 8
             }
             Instruction::LD(
@@ -1360,6 +1407,7 @@ impl CPU {
                 let addr = self.regs.get_de();
                 bus.service_timer(4); self.timer_consumed += 4; bus.instruction_tcycles += 4;
                 self.regs.a = bus.read_byte(addr);
+                bus.service_gpu(4); self.gpu_consumed += 4;
                 8
             }
 
