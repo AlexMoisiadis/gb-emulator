@@ -448,7 +448,10 @@ impl GPU {
     pub fn commit_lcd_enable(&mut self) -> bool {
         self.lcd_enable_pending = false;
         self.mode = PpuMode::Oam2;
-        self.mode_dot = 0;
+        // DMG hardware: mode 2 starts with a 2 M-cycle (8T) internal startup offset.
+        // The first LY increment occurs at 448T from the commit point, not 456T.
+        // This matches the oam_bug/1-lcd_sync test: delay 109 → LY=0, delay 110 → LY=1.
+        self.mode_dot = 8;
         self.latch_visible_line_timing();
         self.wy_triggered = (self.lcdc & 0x20) != 0 && self.ly == self.wy;
         self.stat = (self.stat & !0x03) | PpuMode::Oam2.stat_bits();
