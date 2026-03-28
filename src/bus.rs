@@ -71,6 +71,16 @@ impl MemoryBus {
         self.apply_gpu_events(events);
     }
 
+    /// Commit a deferred LCD enable: enter mode 2 at the scanline boundary and
+    /// raise a STAT interrupt if the mode-2 STAT source is enabled.
+    /// Called from cpu::step() after all service_gpu calls for the enabling instruction.
+    #[inline]
+    pub fn commit_lcd_enable(&mut self) {
+        if self.gpu.commit_lcd_enable() {
+            self.raise_interrupt(InterruptSource::LcdStat);
+        }
+    }
+
     pub fn toggle_mute(&mut self) -> bool {
         self.audio_muted = !self.audio_muted;
         self.audio_muted

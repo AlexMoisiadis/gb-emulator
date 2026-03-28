@@ -166,6 +166,9 @@ pub struct GPU {
     stat_irq_line_prev: bool,
     /// Raise STAT IRQ one dot before the actual HBlank transition (DMG quirk).
     hblank_irq_early: bool,
+    /// True from the moment LCDC bit 7 goes 0→1 until the CPU commits the first
+    /// fresh scanline.  While set, tick() is a no-op and STAT mode stays neutral.
+    lcd_enable_pending: bool,
 
     // Window latches
     wy_triggered: bool, // true when window Y condition was met this frame
@@ -256,6 +259,7 @@ impl GPU {
             sprites_on_line_count: 0,
             stat_irq_line_prev: false,
             hblank_irq_early: false,
+            lcd_enable_pending: false,
             wy_triggered: false,
             wx_latched: 0,
             frame_index: 0,
@@ -433,6 +437,29 @@ impl GPU {
     }
 
     // OAM corruption helpers
+    #[inline]
+    pub fn lcd_enable_is_pending(&self) -> bool {
+        self.lcd_enable_pending
+    }
+
+    /// Commit the deferred LCD-enable: enter mode 2 at dot 0 of LY=0.
+    /// Called by the CPU at the scanline boundary (start of next instruction).
+    /// Returns true if a STAT IRQ edge was triggered.
+    pub fn commit_lcd_enable(&mut self) -> bool {
+        self.lcd_enable_pending = false;
+        self.mode = PpuMode::Oam2;
+        self.mode_dot = 0;
+        self.latch_visible_line_timing();
+        self.wy_triggered = (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+        self.stat = (self.stat & !0x03) | PpuMode::Oam2.stat_bits();
+        if self.ly == self.lyc {
+            self.stat |= 1 << 2;
+        } else {
+            self.stat &= !(1 << 2);
+        }
+        self.drive_stat_line_edge()
+    }
+
     pub fn is_oam2_active(&self) -> bool {
         self.lcd_enabled() && matches!(self.mode, PpuMode::Oam2)
     }
@@ -518,8 +545,6 @@ impl GPU {
         let was_on = self.lcd_enabled();
         let now_on = (v & 0x80) != 0;
         self.lcdc = v;
-        let mut stat_edge = false;
-
         if trace::enabled(TraceCategory::GpuLcdc) && old_lcdc != v {
             eprintln!(
                 "event=gpu_lcdc step={} ly={} from={:02X} to={:02X} lcd_on={}",
@@ -548,26 +573,26 @@ impl GPU {
                 self.hblank_irq_early = false;
             }
             (false, true) => {
-                // LCD ON: restart scanning from LY=0 in mode 2.
-                self.mode = PpuMode::Oam2;
+                // LCD ON: reset state immediately but do not enter mode 2 yet.
+                // The enabling M-cycle does not count as scan time on hardware.
+                // Mode 2 entry is committed by the CPU at the scanline boundary
+                // (start of the next instruction) via commit_lcd_enable().
+                self.lcd_enable_pending = true;
+                self.mode = PpuMode::HBlank0; // neutral — STAT shows mode 0
                 self.mode_dot = 0;
-                self.latch_visible_line_timing();
                 self.ly = 0;
                 self.window_line_counter = 0;
-                self.wy_triggered = (self.lcdc & 0x20) != 0 && self.ly == self.wy;
+                self.wy_triggered = false;
                 self.wx_latched = self.wx;
-                self.stat = (self.stat & !0x03) | PpuMode::Oam2.stat_bits();
-                if self.ly == self.lyc {
-                    self.stat |= 1 << 2;
-                } else {
-                    self.stat &= !(1 << 2);
-                }
+                self.frame_ready = false;
                 self.hblank_irq_early = false;
-                stat_edge = self.drive_stat_line_edge();
+                self.stat_irq_line_prev = false;
+                self.stat = (self.stat & !0x07) | PpuMode::HBlank0.stat_bits();
+                // No stat_edge — STAT IRQ fires when mode 2 is committed.
             }
             _ => {}
         }
-        stat_edge
+        false // STAT IRQ on LCD enable is deferred to commit_lcd_enable()
     }
     #[inline]
     pub fn write_ly(&mut self, _v: u8) -> bool {
@@ -663,6 +688,12 @@ impl GPU {
                 tcycles -= 1;
                 self.step_oam_dma(dma);
             }
+            return events;
+        }
+
+        // LCD is enabled but mode 2 has not yet been committed (pending the next
+        // scanline boundary).  All tick() calls in this state are no-ops.
+        if self.lcd_enable_pending {
             return events;
         }
 

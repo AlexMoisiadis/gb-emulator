@@ -465,6 +465,12 @@ impl CPU {
         bus.service_apu(total_tcycles);
         bus.service_input();
 
+        // 2a) If LCDC bit 7 was just enabled this instruction, commit mode 2 now
+        //     (the scanline boundary — the enabling M-cycle itself does not count).
+        if bus.gpu.lcd_enable_is_pending() {
+            bus.commit_lcd_enable();
+        }
+
         // 3) Apply the deferred IME enable (EI delay completes *after* this instr)
 
         if enable_ime_after_this_instruction {
