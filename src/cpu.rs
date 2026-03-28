@@ -728,15 +728,15 @@ impl CPU {
         // "one read, one glitched write, and another read without a glitched write."
         // The first SP++ fires IDU Write Corruption; the second SP++ does NOT.
         let lo = bus.read_byte(self.sp) as u16;
+        bus.idu_oam_corrupt(self.sp); // same M-cycle as the read
         bus.service_gpu(4); self.gpu_consumed += 4;
-        bus.idu_oam_corrupt(self.sp);
         bus.instruction_tcycles += 4;
         self.sp = self.sp.wrapping_add(1);
         let hi = bus.read_byte(self.sp) as u16;
-        bus.service_gpu(4); self.gpu_consumed += 4;
-        bus.instruction_tcycles += 4;
         // Second SP++ IDU is suppressed per hardware behaviour.
         self.sp = self.sp.wrapping_add(1);
+        bus.service_gpu(4); self.gpu_consumed += 4;
+        bus.instruction_tcycles += 4;
         (hi << 8) | lo
     }
 
