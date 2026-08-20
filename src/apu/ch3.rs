@@ -10,6 +10,9 @@ pub struct Ch3 {
     length_counter: u16, // CH3 uses 256-step length
     length_enabled: bool,
     pub enabled: bool,
+    /// T-cycles left in the window during which the CPU may reach wave RAM
+    /// while the channel is active (DMG). 0 = reads give 0xFF, writes drop.
+    wave_access_ttl: u8,
 }
 
 impl Ch3 {
@@ -24,6 +27,7 @@ impl Ch3 {
             length_counter: 0,
             length_enabled: false,
             enabled: false,
+            wave_access_ttl: 0,
         }
     }
 
@@ -37,22 +41,28 @@ impl Ch3 {
         self.length_counter = 0;
         self.length_enabled = false;
         self.enabled = false;
+        self.wave_access_ttl = 0;
         // wave_ram intentionally NOT cleared
     }
 
     pub fn tick(&mut self, tcycles: u32) {
         if !self.enabled || !self.dac_enabled {
+            self.wave_access_ttl = 0;
             return;
         }
         let mut remaining = tcycles;
         while remaining > 0 {
             // CH3 timer reloads at (2048 - freq) * 2
-            let advance = remaining.min(self.freq_timer);
-            self.freq_timer -= advance;
-            remaining -= advance;
+            let advance = remaining.min(self.freq_timer).max(1);
+            self.freq_timer = self.freq_timer.saturating_sub(advance);
+            remaining = remaining.saturating_sub(advance);
+            // Age the window before opening a new one, so a fetch landing at
+            // the end of this chunk keeps its full lifetime.
+            self.wave_access_ttl = self.wave_access_ttl.saturating_sub(advance.min(255) as u8);
             if self.freq_timer == 0 {
                 self.freq_timer = (2048 - (self.freq as u32)) * 2;
                 self.wave_pos = (self.wave_pos + 1) & 31;
+                self.wave_access_ttl = 2;
             }
         }
     }
@@ -91,7 +101,12 @@ impl Ch3 {
     // ---- Wave RAM -----------------------------------------------------------
     pub fn read_wave_ram(&self, addr: u16) -> u8 {
         if self.enabled && self.dac_enabled {
-            // DMG: while CH3 is active only the currently-accessed byte is readable.
+            // DMG: while CH3 is active wave RAM is reachable only during the
+            // ~2 T-cycle window in which the channel latches a sample byte.
+            // Outside it the bus floats and reads return 0xFF.
+            if self.wave_access_ttl == 0 {
+                return 0xff;
+            }
             self.wave_ram[(self.wave_pos / 2) as usize]
         } else {
             self.wave_ram[(addr - 0xff30) as usize]
@@ -99,7 +114,11 @@ impl Ch3 {
     }
     pub fn write_wave_ram(&mut self, addr: u16, val: u8) {
         if self.enabled && self.dac_enabled {
-            // DMG: while CH3 is active writes only affect the currently-accessed byte.
+            // DMG: outside the latch window the write is dropped entirely;
+            // inside it, it is redirected to the byte being fetched.
+            if self.wave_access_ttl == 0 {
+                return;
+            }
             self.wave_ram[(self.wave_pos / 2) as usize] = val;
         } else {
             self.wave_ram[(addr - 0xff30) as usize] = val;
@@ -155,11 +174,20 @@ impl Ch3 {
     }
 
     fn trigger(&mut self, fs_step: u8) {
-        if self.enabled && self.dac_enabled {
-            // DMG: triggering while active corrupts wave RAM.
-            // The byte just after the current wave position is written to position 0.
-            let src = ((self.wave_pos / 2) as usize + 1) % 16;
-            self.wave_ram[0] = self.wave_ram[src];
+        // DMG: re-triggering while active corrupts wave RAM, but only when the
+        // trigger lands inside the same latch window as a sample fetch.
+        // Source index pairs with the +6 trigger delay above (advance-then-latch).
+        if self.enabled && self.dac_enabled && self.wave_access_ttl != 0 {
+            let offset = ((self.wave_pos >> 1) as usize) & 0x0f;
+            if offset < 4 {
+                self.wave_ram[0] = self.wave_ram[offset];
+            } else {
+                // Beyond byte 3 the whole aligned 4-byte block is copied down.
+                let base = offset & !3;
+                for i in 0..4 {
+                    self.wave_ram[i] = self.wave_ram[base + i];
+                }
+            }
         }
         let is_first_half = fs_step & 1 == 1;
         if self.length_counter == 0 {
@@ -173,7 +201,11 @@ impl Ch3 {
             self.clock_length();
         }
         self.enabled = self.dac_enabled;
-        self.freq_timer = (2048 - (self.freq as u32)) * 2;
+        // Advance-then-latch convention: the first sample fetch sits 6 T-cycles
+        // after the trigger. Must stay paired with the `wave_pos >> 1`
+        // corruption source below — a mixed pair passes 09 and fails 10.
+        self.freq_timer = (2048 - (self.freq as u32)) * 2 + 6;
         self.wave_pos = 0;
+        self.wave_access_ttl = 0;
     }
 }
