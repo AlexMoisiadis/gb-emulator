@@ -50,9 +50,20 @@ GB_HEADLESS_SAVE_FINAL=1         # save final frame as PNG
 GB_HEADLESS_FINAL_PATH=out.png   # output path for final frame
 GB_HEADLESS_HASH=1               # print FNV-1a hash of final frame
 GB_HEADLESS_TIMEOUT_MODE=lcd_aware
+GB_HEADLESS_TIMEOUT_DOTS=702240  # per-frame dot budget; raise for LCD-off windows
 ```
 
-The headless binary auto-detects [Blargg test ROMs](https://gbdev.gg8.se/wiki/articles/Test_ROMs) via the `$A000` signature and streams their text output to stdout.
+The headless binary detects [Blargg test ROMs](https://gbdev.gg8.se/wiki/articles/Test_ROMs) on two channels — the `$A000` protocol and the serial port — and streams their text to stdout.
+
+Every run ends with a `completion=` line on stderr naming why it stopped, and the exit code is meaningful:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Passed (`blargg_pass`, `serial_pass`), or ran to completion with no verdict channel |
+| `1` | Failed (`blargg_fail`, `serial_fail`) |
+| `2` | No verdict reached — `blargg_no_verdict` (stuck) or `frame_budget_exhausted` |
+
+ROMs reporting only via an on-screen CRC (`halt_bug`) or the `ld b,b` register convention (mooneye) cannot be verdicted automatically; they report `no_blargg_signature` and exit `0` regardless of result. Use `GB_HEADLESS_SAVE_FINAL=1` and inspect the frame for those.
 
 ## Test Status
 
@@ -62,9 +73,11 @@ The headless binary auto-detects [Blargg test ROMs](https://gbdev.gg8.se/wiki/ar
 | `instr_timing` | ✅ Pass |
 | `mem_timing` | ✅ All 3 pass |
 | `mem_timing-2` | ✅ All 3 pass |
-| `dmg_sound` | 🔧 In progress |
-| `oam_bug` | 🔧 In progress |
-| `halt_bug` | 🔧 In progress |
+| `halt_bug` | ✅ Pass |
+| `oam_bug` | 🔧 7 of 8 — `8-instr_effect` fails |
+| `dmg_sound` | 🔧 8 of 12 — `03`, `04`, `05` fail; `07` hangs |
+
+Test ROMs are not included in this repository; supply your own.
 
 ## Debug / Trace Feature Flags
 
