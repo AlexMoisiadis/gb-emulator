@@ -41,6 +41,10 @@ pub struct MemoryBus {
     /// T-cycles elapsed within the current instruction (reset at each step()).
     /// Used to compute the correct OAM row for per-M-cycle-accurate corruption.
     pub instruction_tcycles: u32,
+    /// How much of the current instruction has already been ticked into the APU
+    /// by a lazy catch-up. Reconciled against the authoritative total in
+    /// `service_apu()` at instruction end.
+    apu_consumed: u32,
 }
 
 impl MemoryBus {
@@ -60,6 +64,7 @@ impl MemoryBus {
             audio,
             audio_muted: false,
             instruction_tcycles: 0,
+            apu_consumed: 0,
         }
     }
 
@@ -86,10 +91,24 @@ impl MemoryBus {
         self.audio_muted
     }
 
+    /// Advance the APU to the current M-cycle boundary within the instruction.
+    /// Called before any observation that can see sub-instruction APU state:
+    /// APU register / wave RAM access, and the DIV write that resets the FS.
+    #[inline]
+    pub fn sync_apu(&mut self) {
+        let owed = self.instruction_tcycles.saturating_sub(self.apu_consumed);
+        if owed > 0 {
+            self.apu.tick(owed);
+            self.apu_consumed = self.instruction_tcycles;
+        }
+    }
+
     #[inline]
     // In service loop (alongside service_gpu / service_timer):
     pub fn service_apu(&mut self, tcycles: u32) {
-        self.apu.tick(tcycles);
+        // Only the cycles not already applied by a mid-instruction catch-up.
+        self.apu.tick(tcycles.saturating_sub(self.apu_consumed));
+        self.apu_consumed = 0;
         if let Some(audio) = &mut self.audio {
             if self.audio_muted {
                 self.apu.sample_buffer.clear(); // discard, keep buffer from growing
@@ -215,6 +234,9 @@ impl MemoryBus {
                 return 0xFF;
             }
         }
+        if matches!(address, 0xFF10..=0xFF3F) {
+            self.sync_apu();
+        }
         self.mmu.read8(address, &self.gpu, &self.timer, &self.apu)
     }
 
@@ -231,6 +253,11 @@ impl MemoryBus {
             } else if self.gpu.is_xfer3_active() {
                 return;
             }
+        }
+        // 0xFF04: the DIV write resets the frame-sequencer timer, so pending
+        // cycles must land at the old FS position first.
+        if matches!(address, 0xFF10..=0xFF3F | 0xFF04) {
+            self.sync_apu();
         }
         self.mmu.write8(address, value, &mut self.gpu, &mut self.timer, &mut self.apu);
     }
