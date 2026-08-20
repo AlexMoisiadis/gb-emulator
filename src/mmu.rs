@@ -137,6 +137,9 @@ impl MMU {
         }
 
         match addr {
+            // Only bits 0-4 of IF exist; the top three always read as 1.
+            // IE ($FFFF) is a full 8-bit register on DMG and is not masked.
+            IO_IF => self.memory[IO_IF as usize] | 0xe0,
             0x0000..=0x7fff => self.cart.read_rom(addr),
             0xa000..=0xbfff => self.cart.read_ram(addr),
             IO_JOYPAD => self.joypad.read(),
@@ -240,7 +243,13 @@ impl MMU {
                 }
             }
 
-            IO_IF | IO_IE => {
+            IO_IF => {
+                Self::trace_io_write(addr, value, gpu);
+                // Only the low 5 bits are storable; reads OR in 0xE0.
+                self.memory[addr as usize] = value & 0x1f;
+            }
+
+            IO_IE => {
                 Self::trace_io_write(addr, value, gpu);
                 self.memory[addr as usize] = value;
             }

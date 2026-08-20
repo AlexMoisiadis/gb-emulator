@@ -415,7 +415,10 @@ impl CPU {
 
     fn any_pending_interrupt(&self, bus: &mut MemoryBus) -> bool {
         let (ie, iflag) = Self::read_ie_if(bus);
-        (ie & iflag) != 0
+        // Only the 5 real interrupt bits count. IF reads back with 0xE0 set
+        // and IE is fully writable, so an unmasked AND would see phantom
+        // interrupts from bits 5-7.
+        (ie & iflag & 0x1f) != 0
     }
 
     #[inline]
@@ -494,7 +497,7 @@ impl CPU {
             let ie_now = bus.read_byte(0xffff);
             let if_now = bus.read_byte(0xff0f);
             let ime_now = self.ime;
-            let pend = ie_now & if_now;
+            let pend = ie_now & if_now & 0x1f;
 
             // Only print when one of the values changes (prevents console flood)
             if
@@ -570,7 +573,7 @@ impl CPU {
         bus.instruction_tcycles += 4;
         let mut iflag = bus.read_byte(IF_ADDR);
         bus.instruction_tcycles += 4;
-        let pending = ie & iflag;
+        let pending = ie & iflag & 0x1f;
         if pending == 0 {
             return false;
         }
