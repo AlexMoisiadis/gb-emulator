@@ -6,6 +6,11 @@ use std::io::Write as IoWrite;
 const W: usize = 160;
 const H: usize = 144;
 
+/// Exit code for a run that ended without reaching a pass/fail verdict.
+/// Distinct from 1 (a real blargg failure) so a hang cannot be mistaken for
+/// either a pass or a failure.
+const EXIT_NO_VERDICT: i32 = 2;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum TimeoutMode {
     Strict,
@@ -168,8 +173,15 @@ fn main() -> anyhow::Result<()> {
                 println!();
                 if status == 0x00 {
                     eprintln!("blargg: PASSED");
+                    eprintln!("completion=blargg_pass frames={} hard_timeouts={}", f, hard_timeouts);
                 } else {
                     eprintln!("blargg: FAILED (code={:#04x})", status);
+                    eprintln!(
+                        "completion=blargg_fail code={:#04x} frames={} hard_timeouts={}",
+                        status,
+                        f,
+                        hard_timeouts
+                    );
                 }
                 if save_final {
                     bus.gpu.copy_frame(&mut fb);
@@ -237,5 +249,24 @@ fn main() -> anyhow::Result<()> {
         timeout_dots,
         warmup_frames
     );
+
+    // Every exit path reports why it ended. Without this a run that never
+    // reached a verdict — a hang, or a ROM that does not use the $A000
+    // protocol — was indistinguishable from a pass by exit code alone.
+    let (reason, code) = if blargg.is_active() {
+        // Signature validated, so the ROM speaks the protocol, but it never
+        // reported a status within the frame budget: it is stuck.
+        ("blargg_no_verdict", EXIT_NO_VERDICT)
+    } else if hard_timeouts > 0 {
+        ("frame_budget_exhausted", EXIT_NO_VERDICT)
+    } else {
+        // Ran to completion but reports results some other way (e.g. an
+        // on-screen CRC), or is not a test ROM at all.
+        ("no_blargg_signature", 0)
+    };
+    eprintln!("completion={} frames={} hard_timeouts={}", reason, f, hard_timeouts);
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
 }
