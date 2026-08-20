@@ -175,10 +175,13 @@ impl Ch3 {
 
     fn trigger(&mut self, fs_step: u8) {
         // DMG: re-triggering while active corrupts wave RAM, but only when the
-        // trigger lands inside the same latch window as a sample fetch.
-        // Source index pairs with the +6 trigger delay above (advance-then-latch).
-        if self.enabled && self.dac_enabled && self.wave_access_ttl != 0 {
-            let offset = ((self.wave_pos >> 1) as usize) & 0x0f;
+        // trigger lands in the 2 T-cycles *before* a sample fetch — offset by
+        // 2 T from the read/write window, which covers the 2 T after a fetch
+        // (see wave_access_ttl). The bytes copied are the ones the upcoming
+        // fetch is about to address.
+        if self.enabled && self.dac_enabled && self.freq_timer <= 2 {
+            let pos = (self.wave_pos + 1) & 31;
+            let offset = ((pos >> 1) as usize) & 0x0f;
             if offset < 4 {
                 self.wave_ram[0] = self.wave_ram[offset];
             } else {
