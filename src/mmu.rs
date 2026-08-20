@@ -44,6 +44,10 @@ pub struct MMU {
     boot_enabled: bool,
     cart: Cartridge,
     pub joypad: Joypad,
+    /// Bytes sent over the serial port, in order. Blargg's multi-ROM suites
+    /// report their result here rather than through the $A000 protocol, so the
+    /// harness watches this for a terminator.
+    pub serial_out: Vec<u8>,
 }
 
 impl MMU {
@@ -75,6 +79,7 @@ impl MMU {
             boot_enabled: false,
             cart: Cartridge::empty(),
             joypad: Joypad::new(),
+            serial_out: Vec::new(),
         }
     }
 
@@ -246,6 +251,7 @@ impl MMU {
                 if (value & 0x81) == 0x81 {
                     let sb = self.memory[0xff01];
                     print!("{}", sb as char);
+                    self.serial_out.push(sb);
                     self.set_if_bits(0x08);
                 }
             }

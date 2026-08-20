@@ -69,6 +69,38 @@ impl BlarggMonitor {
     }
 }
 
+/// Blargg's multi-ROM suites (cpu_instrs, instr_timing, mem_timing) report
+/// over the serial port instead of the $A000 protocol, ending with "Passed"
+/// or "Failed". Watching for those lets a run stop at the verdict rather than
+/// burning the whole frame budget.
+struct SerialMonitor {
+    scanned: usize,
+}
+
+impl SerialMonitor {
+    fn new() -> Self {
+        Self { scanned: 0 }
+    }
+
+    /// Some(true) = passed, Some(false) = failed, None = still running.
+    /// Only rescans when new bytes have arrived.
+    fn poll(&mut self, bus: &MemoryBus) -> Option<bool> {
+        let out = &bus.mmu.serial_out;
+        if out.len() == self.scanned {
+            return None;
+        }
+        self.scanned = out.len();
+        let text = String::from_utf8_lossy(out);
+        if text.contains("Passed") {
+            Some(true)
+        } else if text.contains("Failed") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -150,6 +182,7 @@ fn main() -> anyhow::Result<()> {
     let mut warmup_timeouts: u32 = 0;
     let mut lcd_off_skips: u32 = 0;
     let mut blargg = BlarggMonitor::new();
+    let mut serial = SerialMonitor::new();
 
     let mut f = 0u32;
     loop {
@@ -188,6 +221,24 @@ fn main() -> anyhow::Result<()> {
                     save_png(&fb, &final_path)?;
                 }
                 std::process::exit(if status == 0x00 { 0 } else { 1 });
+            }
+
+            // Second verdict channel: serial. Kept distinct from the $A000
+            // reasons above so which channel reported stays legible.
+            if let Some(passed) = serial.poll(&bus) {
+                println!();
+                if passed {
+                    eprintln!("serial: PASSED");
+                    eprintln!("completion=serial_pass frames={} hard_timeouts={}", f, hard_timeouts);
+                } else {
+                    eprintln!("serial: FAILED");
+                    eprintln!("completion=serial_fail frames={} hard_timeouts={}", f, hard_timeouts);
+                }
+                if save_final {
+                    bus.gpu.copy_frame(&mut fb);
+                    save_png(&fb, &final_path)?;
+                }
+                std::process::exit(if passed { 0 } else { 1 });
             }
 
             let cy = cpu.step(&mut bus);
