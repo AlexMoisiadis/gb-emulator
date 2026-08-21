@@ -192,15 +192,20 @@ impl PulseChannel {
     /// using the NEW `length_enabled` state (post-write).
     pub fn trigger(&mut self, fs_step: u8) {
         let is_first_half = (fs_step & 1) == 1;
+        // The trigger's extra length clock applies ONLY to a counter that was
+        // just reloaded from 0; it becomes max-1. Clocking an already-nonzero
+        // counter would take a counter of 1 down to 0 while the line below
+        // re-enables the channel, wedging it enabled with a counter that can
+        // never clock again (clock_length is guarded by > 0).
         if self.length_counter == 0 {
             #[cfg(feature = "trace_apu")]
             eprintln!("[PULSE] trigger reload len 0->64");
             self.length_counter = 64;
-        }
-        if self.length_enabled && is_first_half {
-            #[cfg(feature = "trace_apu")]
-            eprintln!("[PULSE] trigger extra clock: len_before={}", self.length_counter);
-            self.clock_length();
+            if self.length_enabled && is_first_half {
+                #[cfg(feature = "trace_apu")]
+                eprintln!("[PULSE] trigger extra clock on reload: 64->63");
+                self.length_counter -= 1;
+            }
         }
         // Enable AFTER all length manipulation so trigger always wins.
         self.enabled = self.dac_enabled;

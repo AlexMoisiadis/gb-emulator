@@ -161,15 +161,16 @@ impl Ch4 {
 
     fn trigger(&mut self, fs_step: u8) {
         let is_first_half = fs_step & 1 == 1;
+        // Reload-only extra clock; see PulseChannel::trigger.
         if self.length_counter == 0 {
             #[cfg(feature = "trace_apu")]
             eprintln!("[CH4] trigger reload len 0->64");
             self.length_counter = 64;
-        }
-        if self.length_enabled && is_first_half {
-            #[cfg(feature = "trace_apu")]
-            eprintln!("[CH4] trigger extra clock: len_before={}", self.length_counter);
-            self.clock_length();
+            if self.length_enabled && is_first_half {
+                #[cfg(feature = "trace_apu")]
+                eprintln!("[CH4] trigger extra clock on reload: 64->63");
+                self.length_counter -= 1;
+            }
         }
         self.enabled = self.dac_enabled;
         self.reload_timer();

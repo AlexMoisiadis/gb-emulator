@@ -193,15 +193,16 @@ impl Ch3 {
             }
         }
         let is_first_half = fs_step & 1 == 1;
+        // Reload-only extra clock; see PulseChannel::trigger.
         if self.length_counter == 0 {
             #[cfg(feature = "trace_apu")]
             eprintln!("[CH3] trigger reload len 0->256");
             self.length_counter = 256;
-        }
-        if self.length_enabled && is_first_half {
-            #[cfg(feature = "trace_apu")]
-            eprintln!("[CH3] trigger extra clock: len_before={}", self.length_counter);
-            self.clock_length();
+            if self.length_enabled && is_first_half {
+                #[cfg(feature = "trace_apu")]
+                eprintln!("[CH3] trigger extra clock on reload: 256->255");
+                self.length_counter -= 1;
+            }
         }
         self.enabled = self.dac_enabled;
         // Advance-then-latch convention: the first sample fetch sits 6 T-cycles
