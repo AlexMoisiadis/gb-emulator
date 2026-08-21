@@ -79,7 +79,21 @@ ROMs reporting only via an on-screen CRC (`halt_bug`) or the `ld b,b` register c
 | `oam_bug` | 🔧 7 of 8 — `8-instr_effect` fails |
 | `interrupt_time` | ❌ Fails — CRC `7F8F4AAF`, expected `B511F33D` |
 
-Test ROMs are not included in this repository; supply your own.
+### Obtaining the test ROMs
+
+Test ROMs are **not** vendored here — supply your own. Every result above was
+measured against [c-sp/game-boy-test-roms](https://github.com/c-sp/game-boy-test-roms)
+release **v7.0**, which bundles blargg, mealybug-tearoom-tests, mooneye and
+dmg-acid2 in one archive.
+
+[`test-roms.lock`](test-roms.lock) pins exactly which files those were: it
+records the archive's SHA-256, then one line per ROM giving its SHA-256, its
+path inside the archive, and where this repo's harness expects it. Verifying
+your copies against it means a mismatch shows up immediately rather than as a
+mysterious test failure.
+
+Note `src/roms/test/mooneye/` is misnamed: 31 of its 32 ROMs are
+mealybug-tearoom-tests PPU tests.
 
 ## Debug / Trace Feature Flags
 
