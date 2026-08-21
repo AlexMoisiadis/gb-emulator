@@ -53,6 +53,14 @@ pub struct Apu {
     /// T-cycles per sample = 4_194_304 / sample_rate
     cycles_per_sample: f32,
 
+    /// DMG analog high-pass filter — removes DC offset so channel enable /
+    /// DAC enable / power cycle do not produce audible pops.
+    hpf_charge: f32,
+    hpf_last_in_l: f32,
+    hpf_last_out_l: f32,
+    hpf_last_in_r: f32,
+    hpf_last_out_r: f32,
+
     /// Filled by tick(), drained by the audio thread via `drain_samples()`.
     /// Interleaved stereo: [L, R, L, R, …]  each sample in –1.0 … +1.0
     pub sample_buffer: Vec<f32>,
@@ -75,8 +83,29 @@ impl Apu {
             nr52: 0xf1, // APU on, CH1 active
             sample_accum: 0.0,
             cycles_per_sample: 4_194_304.0 / sample_rate,
+            hpf_charge: 0.999958_f32.powf(4_194_304.0 / sample_rate),
+            hpf_last_in_l: 0.0,
+            hpf_last_out_l: 0.0,
+            hpf_last_in_r: 0.0,
+            hpf_last_out_r: 0.0,
             sample_buffer: Vec::with_capacity(4096),
         }
+    }
+
+    #[inline]
+    fn hpf_left(&mut self, sample: f32) -> f32 {
+        let out = sample - self.hpf_last_in_l + self.hpf_charge * self.hpf_last_out_l;
+        self.hpf_last_in_l = sample;
+        self.hpf_last_out_l = out;
+        out
+    }
+
+    #[inline]
+    fn hpf_right(&mut self, sample: f32) -> f32 {
+        let out = sample - self.hpf_last_in_r + self.hpf_charge * self.hpf_last_out_r;
+        self.hpf_last_in_r = sample;
+        self.hpf_last_out_r = out;
+        out
     }
 
     // -------------------------------------------------------------------------
@@ -405,17 +434,24 @@ impl Apu {
         let left  = mixer::mix(left_panned[0],  left_panned[1],  left_panned[2],  left_panned[3],  (self.nr50 >> 4) & 0x07);
         let right = mixer::mix(right_panned[0], right_panned[1], right_panned[2], right_panned[3], self.nr50 & 0x07);
 
+        let left  = self.hpf_left(left);
+        let right = self.hpf_right(right);
+
         self.sample_buffer.push(left);
         self.sample_buffer.push(right);
     }
 
     /// Push silence samples without mixing (APU is off).
+    /// Still runs through the HPF so any prior DC level decays smoothly to 0
+    /// rather than cutting off abruptly.
     fn push_silence(&mut self, tcycles: u32) {
         self.sample_accum += tcycles as f32;
         while self.sample_accum >= self.cycles_per_sample {
             self.sample_accum -= self.cycles_per_sample;
-            self.sample_buffer.push(0.0);
-            self.sample_buffer.push(0.0);
+            let l = self.hpf_left(0.0);
+            let r = self.hpf_right(0.0);
+            self.sample_buffer.push(l);
+            self.sample_buffer.push(r);
         }
     }
 
