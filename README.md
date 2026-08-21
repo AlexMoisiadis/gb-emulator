@@ -75,7 +75,9 @@ ROMs reporting only via an on-screen CRC (`halt_bug`) or the `ld b,b` register c
 | `mem_timing-2` | ✅ All 3 pass |
 | `halt_bug` | ✅ Pass |
 | `dmg_sound` | ✅ All 12 pass |
+| `dmg-acid2` | ✅ Pixel-exact against the reference frame |
 | `oam_bug` | 🔧 7 of 8 — `8-instr_effect` fails |
+| `interrupt_time` | ❌ Fails — CRC `7F8F4AAF`, expected `B511F33D` |
 
 Test ROMs are not included in this repository; supply your own.
 
