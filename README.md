@@ -74,8 +74,8 @@ ROMs reporting only via an on-screen CRC (`halt_bug`) or the `ld b,b` register c
 | `mem_timing` | ✅ All 3 pass |
 | `mem_timing-2` | ✅ All 3 pass |
 | `halt_bug` | ✅ Pass |
+| `dmg_sound` | ✅ All 12 pass |
 | `oam_bug` | 🔧 7 of 8 — `8-instr_effect` fails |
-| `dmg_sound` | 🔧 8 of 12 — `03`, `04`, `05` fail; `07` hangs |
 
 Test ROMs are not included in this repository; supply your own.
 
