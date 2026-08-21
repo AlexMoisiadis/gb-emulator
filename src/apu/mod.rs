@@ -420,11 +420,12 @@ impl Apu {
     }
 
     /// Reset all registers and channel state when NR52 bit 7 is written 0.
+    /// DMG quirk: length counters and Ch3 wave RAM are preserved across power-cycle.
     fn power_off_reset(&mut self) {
-        self.ch1 = Ch1::new();
-        self.ch2 = Ch2::new();
-        self.ch3.reset_registers(); // wave RAM is preserved on DMG power-off
-        self.ch4 = Ch4::new();
+        self.ch1.power_off_reset();
+        self.ch2.power_off_reset();
+        self.ch3.power_off_reset();
+        self.ch4.power_off_reset();
         self.frame_seq = FrameSequencer::new();
         self.nr50 = 0;
         self.nr51 = 0;
