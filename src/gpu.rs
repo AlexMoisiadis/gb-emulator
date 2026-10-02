@@ -42,7 +42,7 @@ fn oam_rw(oam: &[u8; 160], row: usize, word: usize) -> u16 {
 #[inline]
 fn oam_ww(oam: &mut [u8; 160], row: usize, word: usize, val: u16) {
     let base = row * 8 + word * 2;
-    oam[base]     = val as u8;
+    oam[base] = val as u8;
     oam[base + 1] = (val >> 8) as u8;
 }
 
@@ -478,25 +478,29 @@ impl GPU {
     /// Row currently being scanned, accounting for `extra_tcycles` elapsed
     /// within the current instruction (for per-M-cycle accurate corruption).
     pub fn oam_row_with_offset(&self, extra_tcycles: u32) -> usize {
-        ((self.mode_dot as u32 + extra_tcycles) as usize / 4).min(19)
+        ((((self.mode_dot as u32) + extra_tcycles) as usize) / 4).min(19)
     }
 
     pub fn corrupt_oam_row(&mut self, row: usize, kind: OamCorruptionKind) {
         match kind {
             OamCorruptionKind::Write => {
-                if row == 0 { return; }
+                if row == 0 {
+                    return;
+                }
                 let a = oam_rw(&self.oam, row, 0);
                 let b = oam_rw(&self.oam, row - 1, 0);
                 let c = oam_rw(&self.oam, row - 1, 2);
                 let w1 = oam_rw(&self.oam, row - 1, 1);
                 let w3 = oam_rw(&self.oam, row - 1, 3);
-                oam_ww(&mut self.oam, row, 0, (a ^ c) & (b ^ c) ^ c);
+                oam_ww(&mut self.oam, row, 0, ((a ^ c) & (b ^ c)) ^ c);
                 oam_ww(&mut self.oam, row, 1, w1);
                 oam_ww(&mut self.oam, row, 2, c);
                 oam_ww(&mut self.oam, row, 3, w3);
             }
             OamCorruptionKind::Read => {
-                if row == 0 { return; }
+                if row == 0 {
+                    return;
+                }
                 let a = oam_rw(&self.oam, row, 0);
                 let b = oam_rw(&self.oam, row - 1, 0);
                 let c = oam_rw(&self.oam, row - 1, 2);
@@ -510,18 +514,20 @@ impl GPU {
             OamCorruptionKind::ReadDuringIncDec => {
                 // Step 1: complex pattern (rows 4–18 only)
                 if row >= 4 && row < 19 {
-                    let a  = oam_rw(&self.oam, row - 2, 0);
-                    let b  = oam_rw(&self.oam, row - 1, 0);
-                    let c  = oam_rw(&self.oam, row,     0);
-                    let d  = oam_rw(&self.oam, row - 1, 2);
+                    let a = oam_rw(&self.oam, row - 2, 0);
+                    let b = oam_rw(&self.oam, row - 1, 0);
+                    let c = oam_rw(&self.oam, row, 0);
+                    let d = oam_rw(&self.oam, row - 1, 2);
                     let new_b = (b & (a | c | d)) | (a & c & d);
-                    let row_m1 = [new_b,
-                                  oam_rw(&self.oam, row - 1, 1),
-                                  oam_rw(&self.oam, row - 1, 2),
-                                  oam_rw(&self.oam, row - 1, 3)];
+                    let row_m1 = [
+                        new_b,
+                        oam_rw(&self.oam, row - 1, 1),
+                        oam_rw(&self.oam, row - 1, 2),
+                        oam_rw(&self.oam, row - 1, 3),
+                    ];
                     oam_ww(&mut self.oam, row - 1, 0, new_b);
                     for wi in 0..4usize {
-                        oam_ww(&mut self.oam, row,     wi, row_m1[wi]);
+                        oam_ww(&mut self.oam, row, wi, row_m1[wi]);
                         oam_ww(&mut self.oam, row - 2, wi, row_m1[wi]);
                     }
                 }
