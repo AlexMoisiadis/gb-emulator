@@ -1,6 +1,6 @@
 [package]
 name = "gb_emulator"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A cycle-accurate DMG (Game Boy) emulator written in Rust"
@@ -12,12 +12,14 @@ readme = "README.md"
 [dependencies]
 
 anyhow = "1.0"
-pixels = "0.15"
-winit  = { version = "0.30", features = ["rwh_05"] }
-png = "0.17"
 bitflags = "2.11.0"
-cpal = "0.17.3"
-ringbuf = "0.4.8"
+
+# Native-only: kept out of the WebAssembly build via the features below.
+pixels  = { version = "0.15", optional = true }
+winit   = { version = "0.30", features = ["rwh_05"], optional = true }
+png     = { version = "0.17", optional = true }
+cpal    = { version = "0.17.3", optional = true }
+ringbuf = { version = "0.4.8", optional = true }
 
 # Optional now; add later when you wire audio
 # gilrs  = "0.10"       # gamepads
@@ -27,3 +29,23 @@ debug_timing = []
 trace_ppu = []
 trace_input = []
 trace_apu = []
+
+default = ["native"]
+audio   = ["dep:cpal", "dep:ringbuf"]
+native  = ["dep:pixels", "dep:winit", "audio", "png"]
+png     = ["dep:png"]
+
+[[bin]]
+name = "viewer"
+path = "src/bin/viewer.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "headless"
+path = "src/bin/headless.rs"
+required-features = ["png"]
+
+[[bin]]
+name = "image_diff"
+path = "src/bin/image_diff.rs"
+required-features = ["png"]

@@ -40,6 +40,13 @@ impl Ch4 {
         }
     }
 
+    /// Reset on APU power-off. DMG preserves the length counter across power-cycle.
+    pub fn power_off_reset(&mut self) {
+        let preserved_length = self.length_counter;
+        *self = Self::new();
+        self.length_counter = preserved_length;
+    }
+
     pub fn tick(&mut self, tcycles: u32) {
         if !self.enabled || !self.dac_enabled {
             return;

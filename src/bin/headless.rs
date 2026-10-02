@@ -1,4 +1,4 @@
-use gb_emulator::{ CPU, MemoryBus };
+use gb_emulator::{ post_boot_init, CPU, MemoryBus };
 use gb_emulator::trace::{ self, Category as TraceCategory };
 use gb_emulator::util::save_png;
 use std::io::Write as IoWrite;
@@ -162,19 +162,7 @@ fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(5000);
 
-    // post_boot_init (same as viewer)
-    cpu.regs.set_af(0x01b0);
-    cpu.regs.set_bc(0x0013);
-    cpu.regs.set_de(0x00d8);
-    cpu.regs.set_hl(0x014d);
-    cpu.sp = 0xfffe;
-    cpu.pc = 0x0100;
-    bus.write_byte(0xff40, 0x91);
-    bus.write_byte(0xff42, 0x00);
-    bus.write_byte(0xff43, 0x00);
-    bus.write_byte(0xff47, 0xfc);
-    bus.write_byte(0xff4a, 0x00);
-    bus.write_byte(0xff4b, 0x00);
+    post_boot_init(&mut cpu, &mut bus);
     bus.load_rom(&rom);
 
     let mut fb = [[0u8; W]; H];
@@ -188,6 +176,7 @@ fn main() -> anyhow::Result<()> {
     loop {
         let limit = if blargg.is_active() { blargg_max_frames } else { frames_to_dump };
         if f >= limit { break; }
+        bus.apu.sample_buffer.clear(); // no audio output here; keep the buffer from growing
         let mut safety_dots = 0u32;
         let mut lcd_on_seen = (bus.read_byte(0xff40) & 0x80) != 0;
         let mut timeout_reason = TimeoutReason::None;

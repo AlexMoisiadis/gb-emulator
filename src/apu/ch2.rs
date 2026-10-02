@@ -14,6 +14,11 @@ impl Ch2 {
         Self { pulse: PulseChannel::new() }
     }
 
+    /// Reset on APU power-off. DMG preserves the length counter across power-cycle.
+    pub fn power_off_reset(&mut self) {
+        self.pulse.power_off_reset();
+    }
+
     pub fn tick(&mut self, tcycles: u32) {
         self.pulse.tick(tcycles);
     }

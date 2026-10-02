@@ -1,7 +1,10 @@
 // src/util.rs — shared utilities used by viewer and headless binaries.
 
+#[cfg(feature = "png")]
 use png::{ BitDepth, ColorType, Encoder };
+#[cfg(feature = "png")]
 use std::fs::File;
+#[cfg(feature = "png")]
 use std::path::Path;
 
 /// Convert a 2-bit DMG shade (0–3) to an 8-bit grayscale value.
@@ -17,6 +20,7 @@ pub fn dmg_shade_to_u8(v: u8) -> u8 {
 }
 
 /// Write a 160×144 DMG framebuffer as an 8-bit grayscale PNG.
+#[cfg(feature = "png")]
 pub fn save_png<P: AsRef<Path>>(fb: &[[u8; 160]; 144], path: P) -> anyhow::Result<()> {
     let mut gray = vec![0u8; 160 * 144];
     for y in 0..144 {

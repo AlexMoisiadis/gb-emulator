@@ -31,6 +31,18 @@ impl Ch1 {
         }
     }
 
+    /// Reset on APU power-off. DMG preserves the length counter across power-cycle.
+    pub fn power_off_reset(&mut self) {
+        self.pulse.power_off_reset();
+        self.sweep_period = 0;
+        self.sweep_negate = false;
+        self.sweep_shift = 0;
+        self.sweep_timer = 0;
+        self.sweep_shadow_freq = 0;
+        self.sweep_enabled = false;
+        self.sweep_negate_used = false;
+    }
+
     pub fn tick(&mut self, tcycles: u32) {
         self.pulse.tick(tcycles);
     }

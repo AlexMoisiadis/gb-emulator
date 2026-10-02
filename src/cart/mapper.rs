@@ -7,4 +7,14 @@ pub trait Mapper: Send {
 
     /// Writes to MBC control regions or ext RAM
     fn write(&mut self, addr: u16, value: u8);
+
+    /// Whole external RAM, for saving and restoring battery-backed carts.
+    /// `None` when the cart has no RAM.
+    fn ram(&self) -> Option<&[u8]> {
+        None
+    }
+
+    fn ram_mut(&mut self) -> Option<&mut [u8]> {
+        None
+    }
 }

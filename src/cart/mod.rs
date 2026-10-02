@@ -79,4 +79,11 @@ impl Cartridge {
     pub fn write(&mut self, addr: u16, value: u8) {
         self.inner.write(addr, value)
     }
+
+    pub fn ram(&self) -> Option<&[u8]> {
+        self.inner.ram()
+    }
+    pub fn ram_mut(&mut self) -> Option<&mut [u8]> {
+        self.inner.ram_mut()
+    }
 }

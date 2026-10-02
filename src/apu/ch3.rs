@@ -31,18 +31,18 @@ impl Ch3 {
         }
     }
 
-    /// Reset all registers on APU power-off but preserve wave RAM contents.
-    pub fn reset_registers(&mut self) {
+    /// Reset on APU power-off. DMG preserves wave RAM AND the length counter
+    /// across power-cycle.
+    pub fn power_off_reset(&mut self) {
         self.dac_enabled = false;
         self.freq = 0;
         self.freq_timer = 0;
         self.wave_pos = 0;
         self.output_level = 0;
-        self.length_counter = 0;
         self.length_enabled = false;
         self.enabled = false;
         self.wave_access_ttl = 0;
-        // wave_ram intentionally NOT cleared
+        // wave_ram and length_counter intentionally NOT cleared
     }
 
     pub fn tick(&mut self, tcycles: u32) {

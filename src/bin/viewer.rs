@@ -1,11 +1,13 @@
 // src/bin/viewer.rs
+use gb_emulator::apu::output::AudioOutput;
 use gb_emulator::gpu::DebugOverlayConfig;
-use gb_emulator::{ CPU, MemoryBus };
+use gb_emulator::{ post_boot_init, CPU, MemoryBus };
 use gb_emulator::input::joypad::Button;
 use gb_emulator::util::{ dmg_shade_to_u8, save_png };
 
 use anyhow::Result;
 use pixels::{ Pixels, SurfaceTexture };
+use ringbuf::traits::Producer;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{ Duration, Instant };
@@ -165,6 +167,8 @@ struct App {
     cpu: Box<CPU>,
     bus: Box<MemoryBus>,
     fb: Framebuffer,
+    audio: Option<AudioOutput>,
+    muted: bool,
 
     // Runtime
     config: ViewerConfig,
@@ -184,6 +188,12 @@ impl App {
 
         let mut cpu = Box::new(CPU::new());
         let mut bus = Box::new(MemoryBus::new());
+        let audio = AudioOutput::new()
+            .map_err(|e| eprintln!("[APU] audio init failed: {e}"))
+            .ok();
+        if let Some(a) = &audio {
+            bus.apu.set_sample_rate(a.sample_rate);
+        }
         post_boot_init(&mut cpu, &mut bus);
 
         // Load ROM
@@ -200,6 +210,8 @@ impl App {
             cpu,
             bus,
             fb: [[0; W]; H],
+            audio,
+            muted: false,
             config,
             run_state,
             stats: ViewerStats::default(),
@@ -283,8 +295,8 @@ impl App {
                 };
             }
             PhysicalKey::Code(KeyCode::KeyM) => {
-                let muted = self.bus.toggle_mute();
-                eprintln!("Audio {}", if muted { "muted" } else { "unmuted" });
+                self.muted = !self.muted;
+                eprintln!("Audio {}", if self.muted { "muted" } else { "unmuted" });
             }
             PhysicalKey::Code(KeyCode::KeyN) => {
                 if self.run_state == RunState::Paused {
@@ -377,6 +389,15 @@ impl App {
         while tcycles < DMG_DOTS_PER_FRAME {
             let cy = self.cpu.step(&mut self.bus);
             tcycles = tcycles.saturating_add(cy);
+        }
+        // Hand this frame's samples to the audio device (or drop them when muted/no device).
+        match &mut self.audio {
+            Some(audio) if !self.muted => {
+                for sample in self.bus.apu.sample_buffer.drain(..) {
+                    let _ = audio.producer.try_push(sample);
+                }
+            }
+            _ => self.bus.apu.sample_buffer.clear(),
         }
         self.stats.last_emu_time = emu_start.elapsed();
 
@@ -617,21 +638,4 @@ fn apply_overlay(bus: &mut MemoryBus, overlays: &OverlayToggles) {
     cfg.shade_axes = 1;
     cfg.shade_sprite_box = 2;
     bus.set_gpu_debug_config(cfg);
-}
-
-fn post_boot_init(cpu: &mut CPU, bus: &mut MemoryBus) {
-    cpu.regs.set_af(0x01b0);
-    cpu.regs.set_bc(0x0013);
-    cpu.regs.set_de(0x00d8);
-    cpu.regs.set_hl(0x014d);
-    cpu.sp = 0xfffe;
-    cpu.pc = 0x0100;
-
-    // Initial LCD state
-    bus.write_byte(0xff40, 0x91); // LCDC
-    bus.write_byte(0xff42, 0x00); // SCY
-    bus.write_byte(0xff43, 0x00); // SCX
-    bus.write_byte(0xff47, 0xfc); // BGP
-    bus.write_byte(0xff4a, 0x00); // WY
-    bus.write_byte(0xff4b, 0x00); // WX
 }
