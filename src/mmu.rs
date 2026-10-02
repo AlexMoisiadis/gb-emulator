@@ -42,7 +42,7 @@ pub struct MMU {
     memory: Box<[u8; 0x10000]>,
     boot_rom: Option<Vec<u8>>,
     boot_enabled: bool,
-    cart: Cartridge,
+    pub(crate) cart: Cartridge,
     pub joypad: Joypad,
     /// Bytes sent over the serial port, in order. Blargg's multi-ROM suites
     /// report their result here rather than through the $A000 protocol, so the
@@ -106,7 +106,13 @@ impl MMU {
     }
 
     pub fn load_rom(&mut self, rom: &[u8]) {
-        self.cart = Cartridge::from_bytes(rom.to_vec()).expect("invalid/unsupported cartridge ROM");
+        self.try_load_rom(rom).expect("invalid/unsupported cartridge ROM");
+    }
+
+    /// Like `load_rom`, but returns an error for a bad or unsupported cart.
+    pub fn try_load_rom(&mut self, rom: &[u8]) -> anyhow::Result<()> {
+        self.cart = Cartridge::from_bytes(rom.to_vec())?;
+        Ok(())
     }
 
     pub fn load_boot_rom(&mut self, bytes: Vec<u8>) {

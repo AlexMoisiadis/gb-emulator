@@ -92,6 +92,14 @@ impl Mbc1 {
 }
 
 impl Mapper for Mbc1 {
+    fn ram(&self) -> Option<&[u8]> {
+        (!self.ram.is_empty()).then_some(&self.ram[..])
+    }
+
+    fn ram_mut(&mut self) -> Option<&mut [u8]> {
+        (!self.ram.is_empty()).then_some(&mut self.ram[..])
+    }
+
     fn read_rom(&self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x3fff => self.rom_byte(self.lower_window_bank(), addr as usize),

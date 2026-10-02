@@ -400,6 +400,10 @@ impl GPU {
     pub fn copy_frame(&self, out: &mut [[u8; LCD_WIDTH]; LCD_HEIGHT]) {
         *out = self.framebuf;
     }
+    #[inline]
+    pub fn frame(&self) -> &[[u8; LCD_WIDTH]; LCD_HEIGHT] {
+        &self.framebuf
+    }
 
     #[inline]
     pub fn take_last_frame_telemetry(&mut self) -> Option<FrameTelemetry> {

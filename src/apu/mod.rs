@@ -6,6 +6,7 @@ pub mod ch3;
 pub mod ch4;
 pub mod frame_seq;
 pub mod mixer;
+#[cfg(feature = "audio")]
 pub mod output;
 pub mod pulse;
 
@@ -407,6 +408,13 @@ impl Apu {
     pub fn drain_samples(&mut self, out: &mut Vec<f32>) {
         out.extend_from_slice(&self.sample_buffer);
         self.sample_buffer.clear();
+    }
+
+    /// Change the output rate. Same maths as `new`, so constructing at one rate
+    /// and switching before the first tick is identical to constructing at the other.
+    pub fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.cycles_per_sample = 4_194_304.0 / sample_rate;
+        self.hpf_charge = 0.999958_f32.powf(4_194_304.0 / sample_rate);
     }
 
     // -------------------------------------------------------------------------

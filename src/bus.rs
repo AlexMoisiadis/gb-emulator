@@ -1,10 +1,8 @@
 // src/bus.rs
 use crate::gpu::{ GPU, GpuEvents, DebugOverlayConfig, DmaRead, OamCorruptionKind };
-use crate::apu::output::AudioOutput;
 use crate::timer::Timer;
 use crate::apu::Apu;
 use crate::mmu::MMU;
-use ringbuf::traits::Producer;
 #[cfg(feature = "trace_ppu")]
 use crate::trace::{ self, Category as TraceCategory };
 
@@ -35,9 +33,9 @@ pub struct MemoryBus {
     pub mmu: MMU,
     pub gpu: GPU,
     timer: Timer,
+    /// Generated samples collect in `apu.sample_buffer`; the frontend must
+    /// drain or clear them every frame (`Apu::drain_samples`).
     pub apu: Apu,
-    audio: Option<AudioOutput>,
-    pub audio_muted: bool,
     /// T-cycles elapsed within the current instruction (reset at each step()).
     /// Used to compute the correct OAM row for per-M-cycle-accurate corruption.
     pub instruction_tcycles: u32,
@@ -49,20 +47,12 @@ pub struct MemoryBus {
 
 impl MemoryBus {
     pub fn new() -> Self {
-        let audio = AudioOutput::new()
-            .map_err(|e| eprintln!("[APU] audio init failed: {e}"))
-            .ok();
-        let sample_rate = audio
-            .as_ref()
-            .map(|a| a.sample_rate)
-            .unwrap_or(44100.0);
         Self {
             mmu: MMU::new(),
             gpu: GPU::new(),
             timer: Timer::new(),
-            apu: Apu::new(sample_rate),
-            audio,
-            audio_muted: false,
+            // Frontends with a real device call apu.set_sample_rate().
+            apu: Apu::new(44100.0),
             instruction_tcycles: 0,
             apu_consumed: 0,
         }
@@ -86,11 +76,6 @@ impl MemoryBus {
         }
     }
 
-    pub fn toggle_mute(&mut self) -> bool {
-        self.audio_muted = !self.audio_muted;
-        self.audio_muted
-    }
-
     /// Advance the APU to the current M-cycle boundary within the instruction.
     /// Called before any observation that can see sub-instruction APU state:
     /// APU register / wave RAM access, and the DIV write that resets the FS.
@@ -109,15 +94,6 @@ impl MemoryBus {
         // Only the cycles not already applied by a mid-instruction catch-up.
         self.apu.tick(tcycles.saturating_sub(self.apu_consumed));
         self.apu_consumed = 0;
-        if let Some(audio) = &mut self.audio {
-            if self.audio_muted {
-                self.apu.sample_buffer.clear(); // discard, keep buffer from growing
-            } else {
-                for sample in self.apu.sample_buffer.drain(..) {
-                    let _ = audio.producer.try_push(sample);
-                }
-            }
-        }
     }
 
     pub fn apply_gpu_events(&mut self, events: GpuEvents) {

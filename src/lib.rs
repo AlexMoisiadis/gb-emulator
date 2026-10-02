@@ -11,8 +11,10 @@ pub mod cart;
 pub mod input;
 pub mod trace;
 pub mod apu;
+pub mod gameboy;
 
 pub use bus::MemoryBus;
+pub use gameboy::{ post_boot_init, GameBoy };
 pub use cpu::CPU;
 pub use gpu::GPU;
 pub use mmu::MMU;
